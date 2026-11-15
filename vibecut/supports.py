@@ -1,42 +1,3 @@
-"""
-supports.py - FDM Support Wizard for VibeCut.
-
-Automatic multi-strategy support generation + Bambu Lab print profile
-recommendation. Instead of embedding pins into the model and
-boolean-trimming them (fragile on non-manifold meshes), the SOLID
-strategies keep a one-layer AIR GAP at every contact and the
-final solid comes from a voxel remesh of overlapping round primitives -
-manifold by construction, no boolean conform step at all.
-
-Everything works in MILLIMETERS (1 Blender unit = 1 mm; Bambu Studio reads
-exported STLs as mm).
-
-Strategy summary (auto-selected per overhang island):
-  BRIDGE  - flat overhang anchored on opposing sides within the bridge
-            span limit: no geometry, the printer bridges it.
-  SEALED  - support region inside a fully sealed internal void: physically
-            impossible to remove supports -> skipped with a warning.
-  CAVITY  - accessible internal cavity (tunnels, recesses): slim tree with
-            small tips and pad feet that rest on the cavity floor.
-  CRADLE  - large, low "underbelly" region (hulls, spheres, lying poses):
-            form-fitting eroded negative block, auto-falls back to pillars
-            when the boolean is not trustworthy.
-  PILLAR  - broad flat overhangs landing on the build plate: round pillar
-            grid with conical contact tips, flared feet and cross ribs.
-  TREE    - everything else (organic shapes, scattered points, steep or
-            tall-thin overhangs): greedy merging branch forest in the
-            spirit of "Clever Support" (Vanek et al. 2014).
-
-After generation the result is validated in-place (manifold, model
-collision, self-intersection, contact gap, coverage, minimum printable
-thickness) with up to two automatic repair retries, and a Bambu Studio
-process preset + plain-English settings guide can be exported.
-
-Output objects live in the "VibeCut Supports" collection, named
-SUP_<model>. Regenerating replaces that model's supports only;
-Remove Supports clears the whole collection.
-"""
-
 import bpy
 import bmesh
 import json
@@ -51,122 +12,87 @@ from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
 
-# --------------------------------------------------------------------------
-# Parameters
-# --------------------------------------------------------------------------
-
 @dataclass
 class Params:
-    # Printer / process facts (Bambu Lab, 0.4 mm nozzle).
     nozzle: float = 0.4
     layer_height: float = 0.2
-    line_width: float = 0.42          # Bambu default for 0.4 mm nozzle
+    line_width: float = 0.42
 
-    # Overhang detection. Angle measured from VERTICAL: a vertical wall is 0,
-    # a horizontal ceiling is 90. Faces steeper than this need support.
-    # 45 is the classic safe value; Bambu's own auto default is ~60.
     overhang_angle: float = 45.0
-    first_layer_z: float = 0.30       # ignore faces this close to the plate
+    first_layer_z: float = 0.30
 
-    # Removability interface.
-    z_gap: float = 0.25               # built-in vertical air gap at contacts
-    xy_clearance: float = 1.0         # lateral keep-out from the model
+    z_gap: float = 0.25
+    xy_clearance: float = 1.0
 
-    # Printability floor: nothing thinner than this is ever generated.
-    # 2 perimeter lines x 0.42 = 0.84 mm; 1.0 adds margin.
     min_feature: float = 1.0
 
-    # Contact tips (diameters).
-    tip_contact_d: float = 1.2        # contact disc, snaps off cleanly
-    tip_taper_len: float = 2.5        # cone length from contact to branch
+    tip_contact_d: float = 1.2
+    tip_taper_len: float = 2.5
 
-    # Tree parameters.
-    branch_d: float = 2.0             # base branch diameter (Bambu default)
-    branch_max_d: float = 4.4         # trunk cap
-    branch_angle: float = 40.0        # max lean from vertical (Bambu cap: 45)
-    merge_radius: float = 9.0         # how far nodes look for a partner
-    step_dz: float = 1.0              # descent step
+    branch_d: float = 2.0
+    branch_max_d: float = 4.4
+    branch_angle: float = 40.0
+    merge_radius: float = 9.0
+    step_dz: float = 1.0
 
-    # Pillar parameters.
     pillar_d: float = 2.4
     pillar_spacing: float = 3.6
     rib_d: float = 1.2
-    slender_ratio: float = 12.0       # height/diameter before thickening+ribs
+    slender_ratio: float = 12.0
 
-    # Cradle parameters.
-    cradle_gap: float = 0.35          # erosion gap (covers remesh blur)
-    cradle_margin: float = 3.0        # XY margin around the island
+    cradle_gap: float = 0.35
+    cradle_margin: float = 3.0
     cradle_enable: bool = True
 
-    # Cavity (internal) supports.
     cavity_tip_d: float = 1.0
     cavity_branch_d: float = 1.6
 
-    # Bridging: spans up to this length are left to the printer.
     bridge_span: float = 10.0
 
-    # Sampling.
-    base_spacing: float = 2.8         # support point spacing on overhangs
-    max_points: int = 1400            # global cap
+    base_spacing: float = 2.8
+    max_points: int = 1400
 
-    # Finishing.
-    voxel_size: float = 0.30          # remesh voxel (min_feature / 3+)
+    voxel_size: float = 0.30
     seed: int = 42
 
-    # Auto-repair.
     max_retries: int = 2
 
-    # Profile target.
-    printer: str = "X1C"              # X1C | P1S | A1 | A1MINI | H2D
-    material: str = "PLA"             # PLA | PETG | ABS
+    printer: str = "X1C"
+    material: str = "PLA"
 
-    strategy_override: str = "AUTO"   # AUTO | TREE | PILLAR
+    strategy_override: str = "AUTO"
 
-    # Support STYLE.
-    #   PINS  - Lychee-style branching supports sized for FDM: a cone tip
-    #           per point, short Y-forks, vertical posts, cone feet + pads.
-    #           Tips embed and are boolean-trimmed flush (the default).
-    #   SOLID - the validated multi-strategy wizard (tree/pillar/cradle/...),
-    #           guaranteed manifold with an air gap. Heavier, but bullet-
-    #           proof on rough or non-printable meshes.
-    #   CLEAR - pins that touch the model ONLY at their tips; every post
-    #           and branch keeps `keepout` from it (grid-routed to the bed).
     style: str = "CLEAR"
 
-    # Pin-style parameters. Lychee uses ~0.35 mm tips (resin); these are
-    # the FDM floor for a 0.4 mm nozzle.
-    pin_spacing: float = 3.5          # min distance between contact tips
-    minima_radius: float = 2.0        # a low point must be lowest this far
-    pin_diameter: float = 1.0         # tip contact diameter
-    pin_overlap: float = 0.5          # tip embeds this far INTO the model
-    pin_base_length: float = 3.0      # cone tip length
-    pin_branch_d: float = 1.8         # post/branch diameter for one tip
-    pillar_diameter: float = 2.6      # max post diameter (grows by load)
-    max_trunk_reach: float = 3.0      # max horizontal fork reach
-    fork_angle: float = 35.0          # max fork lean from vertical
-    clearance: float = 0.4            # min gap between support sides and model
-    rest_ratio: float = 0.4           # rest on model if that post is this
-                                      # fraction of the bed post or shorter
-    max_fork_load: int = 2            # single Y-forks only (Lychee-like)
-    # CLEAR style: hard air gap from the model everywhere but tip cones.
-    keepout: float = 1.0              # min gap support side -> model (mm)
-    merge_reach: float = 4.0          # posts lean to merge within this (mm)
-    route_cell: float = 0.6           # routing grid cell (mm), grows on
-    route_max_cells: int = 40000000   # big models to stay under this
-    foot_h: float = 1.2               # cone foot height above the pad
-    pad_d: float = 6.0                # bed pad disc diameter
-    pad_h: float = 0.8                # bed pad thickness
-    raft_join: float = 14.0           # pads closer than this get joined
-    brace_min_h: float = 6.0          # bays shorter than half this: none
-    brace_step: float = 8.0           # height of one X-brace bay
-    brace_max_bays: int = 4           # per post pair (tall posts: taller bays)
-    brace_max_span: float = 10.0      # posts farther apart: not braced
-    brace_d: float = 1.0              # cross-brace diameter
-    conform: str = "MANIFOLD"         # NONE | MANIFOLD | EXACT | FLOAT
+    pin_spacing: float = 3.5
+    minima_radius: float = 2.0
+    pin_diameter: float = 1.0
+    pin_overlap: float = 0.5
+    pin_base_length: float = 3.0
+    pin_branch_d: float = 1.8
+    pillar_diameter: float = 2.6
+    max_trunk_reach: float = 3.0
+    fork_angle: float = 35.0
+    clearance: float = 0.4
+    rest_ratio: float = 0.4
+    max_fork_load: int = 2
+    keepout: float = 1.0
+    merge_reach: float = 4.0
+    route_cell: float = 0.6
+    route_max_cells: int = 40000000
+    foot_h: float = 1.2
+    pad_d: float = 6.0
+    pad_h: float = 0.8
+    raft_join: float = 14.0
+    brace_min_h: float = 6.0
+    brace_step: float = 8.0
+    brace_max_bays: int = 4
+    brace_max_span: float = 10.0
+    brace_d: float = 1.0
+    conform: str = "MANIFOLD"
 
 
 PRINTERS = {
-    # name: (bed_x, bed_y, max_z, profile inherit suffix)
     "X1C":    (256.0, 256.0, 256.0, "@BBL X1C"),
     "P1S":    (256.0, 256.0, 256.0, "@BBL P1P"),
     "A1":     (256.0, 256.0, 256.0, "@BBL A1"),
@@ -175,7 +101,6 @@ PRINTERS = {
 }
 
 MATERIALS = {
-    # material: (nozzle_temp, bed_temp, bridge_factor, fan)
     "PLA":  (220, 55, 1.00, 100),
     "PETG": (255, 70, 0.55, 60),
     "ABS":  (270, 90, 0.70, 30),
@@ -199,10 +124,6 @@ def _get_or_create_support_collection(scene):
     return coll
 
 
-# --------------------------------------------------------------------------
-# Small geometry helpers
-# --------------------------------------------------------------------------
-
 def _ensure_lookup(bm):
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
@@ -210,19 +131,12 @@ def _ensure_lookup(bm):
 
 
 class PrimitiveSoup:
-    """Collects overlapping round primitives into one mesh.
-
-    bmesh.ops.create_* cost grows with the size of the TARGET bmesh, so
-    one big bmesh is quadratic (measured: 6000 cones 55 s vs 2.3 s in
-    chunks of 300). Primitives go into small chunk bmeshes that are
-    flushed to meshes and joined once in to_mesh()."""
-
     CHUNK = 250
 
     def __init__(self):
         self.bm = bmesh.new()
         self.count = 0
-        self.feet = []   # [(x, y, r)] registry so nearby feet merge
+        self.feet = []
         self._chunks = []
         self._in_chunk = 0
 
@@ -238,7 +152,6 @@ class PrimitiveSoup:
         self.count += 1
 
     def tube(self, p1, p2, r1, r2, segments=10):
-        """Truncated cone from p1 (radius r1) to p2 (radius r2)."""
         d = Vector(p2) - Vector(p1)
         length = d.length
         if length < 1e-5:
@@ -262,7 +175,6 @@ class PrimitiveSoup:
             self.bm, u_segments=u, v_segments=v, radius=r, matrix=mat)
 
     def box(self, matrix):
-        """Unit cube transformed by matrix."""
         self._room()
         bmesh.ops.create_cube(self.bm, size=1.0, matrix=matrix)
 
@@ -294,7 +206,6 @@ def _new_object(name, mesh, collection):
 
 
 def _evaluated_mesh_of(ob):
-    """Mesh datablock with the object's full modifier stack applied."""
     dg = bpy.context.evaluated_depsgraph_get()
     ob_eval = ob.evaluated_get(dg)
     me = bpy.data.meshes.new_from_object(
@@ -303,7 +214,6 @@ def _evaluated_mesh_of(ob):
 
 
 def _apply_modifiers_inplace(ob):
-    """Bake the modifier stack into the object's mesh (no operators)."""
     me = _evaluated_mesh_of(ob)
     old = ob.data
     ob.modifiers.clear()
@@ -321,7 +231,6 @@ def _remove_object(ob):
 
 
 def extract_world_mesh(obj):
-    """Evaluated copy of obj's mesh with the world transform baked in."""
     me = _evaluated_mesh_of(obj)
     me.transform(obj.matrix_world)
     if obj.matrix_world.determinant() < 0.0:
@@ -330,11 +239,6 @@ def extract_world_mesh(obj):
 
 
 def _fix_inside_out(obj, messages):
-    """Point faces outward when the model is inside-out (negative signed
-    volume - common in STL exports). Every overhang test reads face
-    normals, so an inside-out model gets supports inside itself and none
-    under its real overhangs. Fixes obj's own mesh (slicers do the same
-    on import). Returns True if it changed anything."""
     bm = bmesh.new()
     bm.from_mesh(obj.data)
     vol = bm.calc_volume(signed=True)
@@ -368,7 +272,6 @@ def build_bvh(me):
 
 
 def convex_hull_2d(points):
-    """Andrew monotone chain. points: [(x, y)] -> hull [(x, y)] CCW."""
     pts = sorted(set((round(p[0], 4), round(p[1], 4)) for p in points))
     if len(pts) <= 2:
         return list(pts)
@@ -390,7 +293,6 @@ def convex_hull_2d(points):
 
 
 def point_in_hull(pt, hull, tol=0.0):
-    """Is 2D pt inside the CCW hull (expanded by tol)?"""
     n = len(hull)
     if n < 3:
         return False
@@ -401,7 +303,6 @@ def point_in_hull(pt, hull, tol=0.0):
         elen = math.hypot(ex, ey)
         if elen < 1e-9:
             continue
-        # signed distance of pt left of edge
         d = ((pt[0] - ax) * ey - (pt[1] - ay) * ex) / elen
         if d > tol:
             return False
@@ -434,36 +335,26 @@ def _net_crossings(bvh, p, d, max_hops=32):
 
 
 def point_inside_solid(bvh, p, max_hops=32):
-    """Solid test by signed crossing count: each hit counts +1 when the ray
-    leaves solid (normal agrees with the ray) and -1 when it enters. Net > 0
-    means inside. Cast BOTH up and down and OR the verdicts: meshes built
-    from overlapping parts have coincident planes whose twin crossings get
-    collapsed along one direction or the other, so a single direction can
-    mis-vote either way."""
     if _net_crossings(bvh, p, Vector((0, 0, 1)), max_hops) > 0:
         return True
     return _net_crossings(bvh, p, Vector((0, 0, -1)), max_hops) > 0
 
 
-# --------------------------------------------------------------------------
-# Analysis
-# --------------------------------------------------------------------------
-
 @dataclass
 class Island:
     idx: int
-    faces: list                       # polygon indices
+    faces: list
     area: float = 0.0
     z_min: float = 0.0
     z_max: float = 0.0
-    flatness: float = 0.0             # area frac with normal within 20 deg of -Z
+    flatness: float = 0.0
     mean_nz: float = 0.0
     centroid: Vector = field(default_factory=lambda: Vector())
-    anchored_edges: list = field(default_factory=list)   # [(a2d, b2d)]
+    anchored_edges: list = field(default_factory=list)
     free_edges: list = field(default_factory=list)
     boundary_len: float = 0.0
     anchored_len: float = 0.0
-    samples: list = field(default_factory=list)          # [(co, normal)]
+    samples: list = field(default_factory=list)
     plate_frac: float = 0.0
     enclosed_frac: float = 0.0
     sealed: bool = False
@@ -475,7 +366,7 @@ class Island:
 
 @dataclass
 class Analysis:
-    me: object = None                 # world-space evaluated mesh (owned)
+    me: object = None
     bvh: object = None
     islands: list = field(default_factory=list)
     model_h: float = 0.0
@@ -483,14 +374,13 @@ class Analysis:
     model_min: tuple = (0, 0, 0)
     model_max: tuple = (0, 0, 0)
     total_overhang_area: float = 0.0
-    bridges: list = field(default_factory=list)          # spans (mm)
+    bridges: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     dropped_by: float = 0.0
     n_faces: int = 0
 
 
 def drop_to_plate(obj, report):
-    """Translate the object so its lowest point sits on z=0."""
     me = extract_world_mesh(obj)
     if not me.vertices:
         bpy.data.meshes.remove(me)
@@ -546,13 +436,11 @@ def analyze(obj, P: Params):
             if min(zs_f) > P.first_layer_z:
                 support_face[p.index] = True
 
-    # Edge -> faces adjacency restricted to what we need.
     edge_faces = {}
     for p in polys:
         for ek in p.edge_keys:
             edge_faces.setdefault(ek, []).append(p.index)
 
-    # Islands via BFS over support faces sharing an edge.
     visited = [False] * A.n_faces
     islands = []
     for f0 in range(A.n_faces):
@@ -607,15 +495,13 @@ def analyze(obj, P: Params):
         isl.centroid = cen / area
         isl.z_min, isl.z_max = zmin, zmax
 
-        # Boundary edges: anchored if the neighbouring non-support face
-        # descends below the edge (a wall that carries load downward).
         for f in members:
             p = polys[f]
             for ek in p.edge_keys:
                 fs = edge_faces[ek]
                 others = [g for g in fs if g != f and g in member_set]
                 if others:
-                    continue  # interior edge of the island
+                    continue
                 va, vb = verts[ek[0]].co, verts[ek[1]].co
                 edge_z = min(va.z, vb.z)
                 seg = ((va.x, va.y), (vb.x, vb.y))
@@ -635,12 +521,10 @@ def analyze(obj, P: Params):
                 else:
                     isl.free_edges.append(seg)
 
-        # --- sampling -----------------------------------------------------
         spacing = max(2.2, min(4.2, sqrt(area) / 6.0))
         isl.spacing = spacing
-        candidates = []   # (priority, co, normal)
+        candidates = []
 
-        # Mandatory: lowest band of the island (tips, chins, local minima).
         low_band = zmin + 0.8
         for f in members:
             p = polys[f]
@@ -649,10 +533,8 @@ def analyze(obj, P: Params):
                 if v.co.z <= low_band:
                     candidates.append((0, v.co.copy(), p.normal.copy()))
 
-        # Free-boundary rim points (overhang rims curl without support).
         for (a2, b2) in isl.free_edges:
             mx, my = (a2[0] + b2[0]) * 0.5, (a2[1] + b2[1]) * 0.5
-            # pull slightly toward the island centroid so tips sit inside
             dx, dy = isl.centroid.x - mx, isl.centroid.y - my
             L = math.hypot(dx, dy)
             if L > 1e-6:
@@ -664,7 +546,6 @@ def analyze(obj, P: Params):
                 candidates.append((1, hit[0].copy(),
                                    polys[hit[2]].normal.copy()))
 
-        # Area sampling over the island's triangles.
         target = area / (spacing * spacing * 0.55)
         for f in members:
             p = polys[f]
@@ -680,9 +561,6 @@ def analyze(obj, P: Params):
                     co = vco[0] + (vco[1] - vco[0]) * r1 + (vco[2] - vco[0]) * r2
                     candidates.append((2, co.copy(), p.normal.copy()))
 
-        # Blue-noise thinning, mandatory points first. Drop samples that are
-        # backed by solid material just below (e.g. coincident interfaces) -
-        # those spots are already supported by the model itself.
         candidates.sort(key=lambda c: c[0])
         accepted = []
         min_d = spacing * 0.8
@@ -694,9 +572,6 @@ def analyze(obj, P: Params):
                     break
             if not ok:
                 continue
-            # Jittered probes in all four quadrants: samples sitting
-            # exactly on part-junction boundaries or corners must count
-            # as model-backed too.
             backed = False
             for jx, jy in ((0.0, 0.0), (0.13, 0.07), (-0.11, -0.09),
                            (0.13, -0.09), (-0.11, 0.08)):
@@ -711,7 +586,6 @@ def analyze(obj, P: Params):
                 break
         isl.samples = accepted
 
-        # --- ray classification --------------------------------------------
         plate = 0
         enclosed_hits = 0
         enclosed_rays = 0
@@ -732,7 +606,6 @@ def analyze(obj, P: Params):
         isl.enclosed_frac = (enclosed_hits / enclosed_rays
                              if enclosed_rays else 0.0)
 
-        # Sealed check: rays in many directions from just below the centroid.
         if isl.enclosed_frac > 0.75:
             sealed = True
             c0 = isl.centroid + Vector((0, 0, -1.0))
@@ -753,10 +626,6 @@ def analyze(obj, P: Params):
         A.islands.append(isl)
         iid += 1
 
-    # Enforce the GLOBAL sample budget: big organic models can produce
-    # dozens of islands x hundreds of samples, and tree growth cost is
-    # superlinear in tip count. Samples are priority-ordered (lowest
-    # points and rims first), so truncating keeps the critical ones.
     total = sum(len(isl.samples) for isl in A.islands)
     if total > P.max_points:
         scale = P.max_points / total
@@ -774,13 +643,10 @@ def analyze(obj, P: Params):
 
 
 def _is_bridge(isl: Island, A: Analysis, P: Params):
-    """Flat island where EVERY sample has solid backing on two opposing
-    sides within the bridge span. Probes the actual solid (parity rays), so
-    it works for coincident-face junctions too, not just connected meshes."""
     if P.bridge_span <= 0.0:
         return False, 0.0
     if isl.area < 10.0:
-        return False, 0.0  # tiny islands: a tip is cheaper and safer
+        return False, 0.0
     if isl.flatness < 0.65:
         return False, 0.0
     if (isl.z_max - isl.z_min) > 1.2:
@@ -817,8 +683,6 @@ def _is_bridge(isl: Island, A: Analysis, P: Params):
 
 
 def _undercut_free(A: Analysis, top_z):
-    """True if nothing below top_z sticks out past the silhouette at top_z
-    (i.e. the model can be lifted up out of a cradle reaching top_z)."""
     slab = []
     below = []
     for v in A.me.vertices:
@@ -896,8 +760,6 @@ def classify(A: Analysis, P: Params):
         if (isl.flatness > 0.60 and isl.plate_frac > 0.90
                 and isl.area >= 40.0):
             isl.strategy = STRAT_PILLAR
-            # Tall pillars get thickened against buckling; widen the grid
-            # so neighbouring shafts can never weld into thin webs.
             r_p = P.pillar_d * 0.5
             r_est = r_p
             if isl.z_min / (2.0 * r_p) > P.slender_ratio:
@@ -910,17 +772,11 @@ def classify(A: Analysis, P: Params):
         isl.coverage_radius = max(2.2, isl.spacing * 0.85)
 
 
-# --------------------------------------------------------------------------
-# Generators
-# --------------------------------------------------------------------------
-
 def _radius_for_load(load, r_tip, r_cap):
     return min(r_cap, r_tip * (load ** 0.4))
 
 
 def _push_clear(bvh, p, r_need, max_push=1.3):
-    """Push a point horizontally away from the model until it clears
-    r_need. Returns the pushed point, or None if it cannot clear."""
     q = Vector(p)
     for _ in range(3):
         loc, nn, _, dist = bvh.find_nearest(q)
@@ -933,7 +789,7 @@ def _push_clear(bvh, p, r_need, max_push=1.3):
                 return None
             away = Vector((nn.x, nn.y, 0.0))
             if away.length < 1e-6:
-                return q  # only solid straight above/below
+                return q
         need = r_need - dist + 0.05
         if (q - Vector(p)).length + need > max_push:
             return None
@@ -953,14 +809,7 @@ class _Node:
         self.load = load
         self.alive = True
         self.stuck = 0
-        # Steps the node may descend WITHOUT re-querying the model BVH:
-        # if the nearest surface is D away, it cannot be reached in fewer
-        # than (D - r - clearance) / max_step_motion steps. Cuts BVH
-        # queries ~5-10x for branches descending through open space.
         self.skip = 0
-        # Start of an unemitted straight vertical run (one tube per run
-        # instead of one per step - tall models otherwise emit millions
-        # of soup vertices).
         self.run0 = None
 
 
@@ -971,10 +820,6 @@ def _flush_run(soup, n):
 
 
 def _plate_foot(soup, bvh, p, r):
-    """Flared foot on the build plate. The flare is pushed or shrunk so it
-    cannot clip model walls that meet the plate nearby. A slanted
-    transition cone's end disc tilts with the axis, so its rim would dip
-    below the plate - the slant ends high enough to keep the rim at z>=0."""
     r_f = max(r * 1.6, 2.5)
     base = Vector((p.x, p.y, 0.45))
     pushed = _push_clear(bvh, base, r_f + 0.30, max_push=2.5)
@@ -984,8 +829,6 @@ def _plate_foot(soup, bvh, p, r):
             r_f = max(r, min(r_f, dist - 0.30))
         pushed = base
     elif (pushed - base).length > 0.3:
-        # The slanted transition cone must not sweep through geometry
-        # standing between the trunk and the pushed base.
         mid = Vector(((p.x + pushed.x) / 2, (p.y + pushed.y) / 2, 1.1))
         locm, _, _, dm = bvh.find_nearest(mid)
         if locm is not None and dm < (r + r_f) * 0.5 + 0.30:
@@ -994,8 +837,6 @@ def _plate_foot(soup, bvh, p, r):
                 r_f = max(r, min(r_f, dist - 0.30))
             pushed = base
     bx, by = pushed.x, pushed.y
-    # Near-tangent neighbouring feet weld into unprintable thin webs in
-    # the voxel union - snap onto an existing foot instead.
     for fx, fy, fr in soup.feet:
         d = math.hypot(bx - fx, by - fy)
         if d < fr + r_f + 0.9:
@@ -1009,17 +850,11 @@ def _plate_foot(soup, bvh, p, r):
     dip = r_f * (lat / max(math.hypot(lat, drop), 1e-6))
     end_z = 0.6 + dip
     soup.tube(Vector((p.x, p.y, 1.7 + dip)), Vector((bx, by, end_z)), r, r_f)
-    # Run through the plate; everything below z=0 is trimmed at finalize.
     soup.tube(Vector((bx, by, end_z)), Vector((bx, by, -0.8)), r_f, r_f)
 
 
 def _model_foot(soup, bvh, hit_p, hit_n, r, gap):
-    """Rounded pad resting on the model with a vertical air gap. On curved
-    floors the pad seats above the highest local point under its footprint;
-    next to walls it shrinks to the lateral room available. Returns the pad
-    top, or None if no printable pad fits here."""
     r_pad = max(r * 1.3, 1.6)
-    # Lateral room: horizontal rays from just above the pad.
     c = hit_p + Vector((0, 0, gap + 0.6))
     d_lat = 1e30
     for k in range(8):
@@ -1045,7 +880,6 @@ def _model_foot(soup, bvh, hit_p, hit_n, r, gap):
 
     top_z = _rise(r_pad)
     if top_z - hit_p.z > 0.9:
-        # Steep terrain under the pad: shrink it and re-seat.
         r_pad = max(0.9, r_pad * 0.55)
         top_z = _rise(r_pad)
     base = Vector((hit_p.x, hit_p.y, top_z + gap))
@@ -1056,9 +890,6 @@ def _model_foot(soup, bvh, hit_p, hit_n, r, gap):
 
 def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                 contacts):
-    """Greedy merging descent. tips: [(co, normal, meta)] where meta is the
-    sample bookkeeping dict (or None). Emits geometry into soup and records
-    contact points into `contacts`."""
     if not tips:
         return 0
     gap = P.z_gap
@@ -1068,10 +899,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
 
     for co, nrm, meta in tips:
         apex = co + Vector((0, 0, -gap))
-        # Tilted contact faces: the horizontal apex disc would clip the
-        # rising surface across its radius. Slide the apex downhill (the
-        # horizontal direction of the face normal) far enough that the
-        # uphill rim stays below the local surface.
         h = Vector((nrm.x, nrm.y, 0.0))
         if h.length > 1e-6 and abs(nrm.z) > 1e-6:
             tan_th = h.length / abs(nrm.z)
@@ -1081,23 +908,15 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                     off = max(off, 0.35 + tip_r)
                 apex += h.normalized() * off
 
-        # Overhangs almost at the plate support themselves on the first
-        # couple of layers - and there is no room for a tip anyway.
         if apex.z < 0.55:
             if meta is not None:
                 meta["strat"] = "TIGHT"
             continue
 
-        # Lateral clearance for the tip cone BODY (the apex itself sits
-        # gap-close to the contact face on purpose, so it is not checked).
-        # Check where the cone has grown to branch_r; push the whole tip
-        # sideways off nearby walls, fall back to a slim tip in narrow
-        # slits, and only then give up.
         r_eff = branch_r
         tip_r_eff = tip_r
 
         def _cone_clear(ap, r_low, r_top):
-            """Both the cone start and the mid-cone must clear the model."""
             p_low = ap + Vector((0, 0, -taper))
             q = _push_clear(A.bvh, p_low, r_low + 0.30, max_push=1.3)
             if q is None:
@@ -1128,9 +947,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
             r_eff = slim_r
             tip_r_eff = min(tip_r, slim_r + 0.1)
 
-        # Tight-slit handling: if the model is closer below than the tip
-        # taper, either drop a micro support or skip (a support could never
-        # fit there - matching what slicers do).
         hit0 = A.bvh.ray_cast(apex + Vector((0, 0, -0.02)),
                               Vector((0, 0, -1)))
         d_below = (apex.z - hit0[0].z) if hit0[0] is not None else apex.z
@@ -1145,9 +961,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                     if meta is not None:
                         meta["strat"] = "TIGHT"
             elif hit0[0] is None and d_below >= 1.0:
-                # Near-plate tip: short straight micro-pillar to the plate
-                # (runs through it; trimmed flat at finalize). Crowded
-                # micros weld into thin webs - keep them 2.6 mm apart.
                 r_mic = max(tip_r_eff, 0.8)
                 too_close = any(
                     math.hypot(apex.x - fx, apex.y - fy) < 2.6
@@ -1155,8 +968,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                 if too_close:
                     contacts.append(co.copy())
                     continue
-                # The column must also stay clear of bulging walls on the
-                # way down (e.g. a chin curving forward below the tip).
                 def _col_ok(ax, ay):
                     for fz in (0.30, 0.55, 0.80):
                         pz = Vector((ax, ay, apex.z * fz))
@@ -1172,8 +983,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                                           max_push=0.9)
                     if pushed2 is not None and _col_ok(pushed2.x, pushed2.y):
                         ax, ay = pushed2.x, pushed2.y
-                        # On curved undersides the surface at the pushed
-                        # XY can be LOWER - re-derive the column top there.
                         h2 = A.bvh.ray_cast(Vector((ax, ay, top_z + 60.0)),
                                             Vector((0, 0, -1)))
                         if h2[0] is not None:
@@ -1211,7 +1020,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
         alive = [n for n in nodes if n.alive]
         if not alive:
             break
-        # Merge pass.
         if len(alive) > 1:
             kd = KDTree(len(alive))
             for i, n in enumerate(alive):
@@ -1231,9 +1039,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                     pm = (n.p * w1 + m.p * w2) / (w1 + w2)
                     pm.z = min(n.p.z, m.p.z)
                     new_r = _radius_for_load(w1 + w2, branch_r, cap_r)
-                    # A straight merge tube between two clear nodes can
-                    # still chord through convex surfaces - verify the
-                    # junction AND points along both tubes clear the model.
                     blocked = False
                     for q in (pm,
                               n.p.lerp(pm, 0.4), n.p.lerp(pm, 0.75),
@@ -1254,7 +1059,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                     m.alive = False
                     merged.add(j)
 
-        # Descent pass.
         for n in nodes:
             if not n.alive:
                 continue
@@ -1267,9 +1071,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                 n.alive = False
                 continue
 
-            # Verified-clear window: descend straight without re-querying
-            # the BVH (the surface provably cannot be reached yet). The
-            # whole run is emitted as ONE tube when it ends.
             if n.skip > 0:
                 n.skip -= 1
                 if n.run0 is None:
@@ -1279,7 +1080,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                 continue
             _flush_run(soup, n)
 
-            # Pick a lateral pull: toward the nearest other node.
             pull = Vector((0, 0, 0))
             best_d = P.merge_radius
             for m in nodes:
@@ -1306,7 +1106,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                     clear_d = 1e9 if loc is None else dist
                     break
             if chosen is None:
-                # try moving away from the model
                 loc, nrm, _, dist = bvh.find_nearest(n.p)
                 if loc is not None:
                     away = n.p - loc
@@ -1322,7 +1121,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                 n.stuck += 1
                 if n.stuck < 3:
                     continue
-                # Rest on the model below.
                 hit = bvh.ray_cast(n.p, Vector((0, 0, -1)))
                 top = None
                 if hit[0] is not None and hit[1].z > 0.25:
@@ -1331,18 +1129,17 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                     soup.tube(n.p, top, n.r, n.r)
                     soup.sphere(n.p, n.r)
                 else:
-                    soup.sphere(n.p, n.r)  # cap it; coverage check decides
+                    soup.sphere(n.p, n.r)
                 n.alive = False
                 continue
 
             n.stuck = 0
-            # Landing checks straight below the new position.
             hit = bvh.ray_cast(chosen, Vector((0, 0, -1)))
             if hit[0] is not None and (chosen.z - hit[0].z) <= P.step_dz + gap + 1.2:
                 if hit[1].z > 0.25:
                     top = _model_foot(soup, A.bvh, hit[0], hit[1], n.r, gap)
                     if top is None:
-                        n.stuck += 1  # no pad fits; try to dodge instead
+                        n.stuck += 1
                         continue
                     soup.tube(chosen, top, n.r, n.r)
                     soup.tube(n.p, chosen, n.r, n.r)
@@ -1353,8 +1150,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
                 soup.sphere(chosen, n.r)
             n.p = chosen
             segs += 1
-            # Max motion per step is dz * (1 + tan(angle)) < 1.9 dz; the
-            # node cannot close the measured clearance faster than that.
             if clear_d < 1e8:
                 n.skip = max(0, min(12, int(
                     (clear_d - n.r - clear * 0.55)
@@ -1369,8 +1164,6 @@ def grow_forest(soup, tips, A, P: Params, tip_r, branch_r, cap_r,
 
 
 def gen_pillars(soup, isl: Island, A: Analysis, P: Params, contacts):
-    """Round pillars with conical tips, flared feet and cross ribs."""
-    # Thin the island samples to the island's pillar spacing.
     spacing = max(isl.spacing, P.pillar_spacing)
     sites = []
     for co, nrm in isl.samples:
@@ -1387,7 +1180,6 @@ def gen_pillars(soup, isl: Island, A: Analysis, P: Params, contacts):
     columns = []
     for co, nrm in sites:
         apex = co + Vector((0, 0, -P.z_gap))
-        # Keep the pillar body clear of nearby walls.
         probe = apex + Vector((0, 0, -P.tip_taper_len))
         pushed = _push_clear(A.bvh, probe, r_p + 0.30, max_push=1.4)
         if pushed is None:
@@ -1405,8 +1197,6 @@ def gen_pillars(soup, isl: Island, A: Analysis, P: Params, contacts):
         r_use = r_p
         if height / (2 * r_p) > P.slender_ratio:
             r_use = min(2.0, height / (2 * P.slender_ratio))
-        # Wall pushes can shove two thinned sites back together; a pair of
-        # near-tangent shafts welds into an unprintable web in the remesh.
         too_close = False
         for (a_prev, bz_prev, r_prev) in columns:
             if math.hypot(apex.x - a_prev.x, apex.y - a_prev.y) \
@@ -1418,7 +1208,6 @@ def gen_pillars(soup, isl: Island, A: Analysis, P: Params, contacts):
         cone_end = apex + Vector((0, 0, -P.tip_taper_len))
         if on_model:
             if height < P.tip_taper_len + 1.6:
-                # Not enough room for tip + pad: micro support or skip.
                 if height >= 1.4 and hit[1].z > 0.25:
                     pad_top = _model_foot(soup, A.bvh, hit[0], hit[1],
                                           max(tip_r, 0.6), P.z_gap)
@@ -1440,7 +1229,6 @@ def gen_pillars(soup, isl: Island, A: Analysis, P: Params, contacts):
             soup.tube(Vector((apex.x, apex.y, 1.7)), cone_end, r_use, r_use)
         columns.append((apex, bottom_z, r_use))
 
-    # Cross ribs between tall neighbouring pillars.
     if len(columns) >= 2:
         kd = KDTree(len(columns))
         for i, (apex, bz, r) in enumerate(columns):
@@ -1463,8 +1251,6 @@ def gen_pillars(soup, isl: Island, A: Analysis, P: Params, contacts):
                     z = max(z, max(bz, bz2) + 2.0)
                     pa = Vector((apex.x, apex.y, z))
                     pb = Vector((a2.x, a2.y, z))
-                    # The rib must not pass through model geometry
-                    # standing between the two pillars.
                     clear = True
                     for t in (0.25, 0.5, 0.75):
                         loc, _, _, dr = A.bvh.find_nearest(pa.lerp(pb, t))
@@ -1480,15 +1266,6 @@ def gen_pillars(soup, isl: Island, A: Analysis, P: Params, contacts):
 
 def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
                contacts):
-    """Boolean negative 'cradle' block under a low underbelly island.
-
-    Near-tangent zones - where the model surface comes closer to the plate
-    than any printable feature - are explicitly cut out with clean cylinder
-    booleans (displacement morphology there endlessly breeds knife edges
-    and slivers); their samples are returned as leftovers for the tree/
-    micro-pillar machinery.
-
-    Returns (mesh or None, leftover_sample_list)."""
     pad = P.cradle_margin
     xs = [A.me.vertices[vi].co.x for f in isl.faces
           for vi in A.me.polygons[f].vertices]
@@ -1501,13 +1278,8 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
     top_z = isl.z_max + 0.8
     if top_z < 1.5:
         top_z = 1.5
-    # The box runs below the plate so the erosion cannot lift its floor
-    # off the plate; the result is trimmed flat at z=0 afterwards.
     z_lo = -2.5
 
-    # Tangent-zone detection: columns where the model's lowest surface is
-    # so close to the plate that the eroded cradle there would be thinner
-    # than printable. Those columns get cut out cleanly.
     net_erosion = max(P.cradle_gap, 0.45) + 0.60 - 0.30 + 0.15
     danger_h = net_erosion + 0.7
     step = 2.0
@@ -1551,9 +1323,6 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
                 leftover_idx.add(k)
                 break
 
-    # Box object. The four vertical edges get a generous bevel: sharp
-    # vertical creases accumulate displacement bias over the erosion
-    # passes and end up as protruding hair-fins - rounded corners do not.
     bm = bmesh.new()
     bmesh.ops.create_cube(bm, size=1.0)
     mat = (Matrix.Translation(Vector(((x0 + x1) / 2, (y0 + y1) / 2,
@@ -1572,11 +1341,9 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
     bm.free()
     box = _new_object("FDMW_cradle_tmp", box_me, collection)
 
-    # Model copy object (world-space mesh, identity transform).
     model_me = A.me.copy()
     model_ob = _new_object("FDMW_model_tmp", model_me, collection)
 
-    # Tangent-zone cutters: one clean cylinder per cluster.
     cutters = None
     if clusters:
         cbm = bmesh.new()
@@ -1615,19 +1382,10 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
         r1 = box.modifiers.new("rm1", 'REMESH')
         r1.mode = 'VOXEL'
         r1.voxel_size = vox
-        # 1) Erode the full clearance gap FIRST.
         gap_e = max(P.cradle_gap, 0.45)
         _disp("erode", -gap_e)
-        # 2) Asymmetric morphological opening: shrink eats every feature
-        #    thinner than ~1.2 mm (knife edges at near-tangent zones), the
-        #    smaller grow restores bulk surfaces. Because grow < erode, no
-        #    regrown lip can ever cross back over the model surface.
         _disp("open_shrink", -0.60)
         _disp("open_grow", 0.30)
-        # 3) Deburr: displacement under-shoots at convex creases, so any
-        #    GROW step rebirths a hair-thin lip ring at rim edges. The
-        #    chain must END on a shrink - it annihilates sub-0.3 mm
-        #    feathers and nothing after it can recreate them.
         _disp("deburr_shrink", -0.15)
         _apply_modifiers_inplace(box)
 
@@ -1638,8 +1396,6 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
         if vol > 0.97 * box_vol or vol < 0.02 * box_vol:
             raise RuntimeError("boolean produced a degenerate cradle")
 
-        # Remesh blur can locally eat into the clearance gap; verify with
-        # an overlap test and erode a little further if needed.
         gap_ok = False
         for k in range(3):
             cb = bmesh.new()
@@ -1662,15 +1418,10 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
         if not gap_ok:
             raise RuntimeError("cradle still touching the model")
 
-        # Trim first: where the eroded bowl floor crosses the plate, the
-        # cut creates annular slivers - the thin-strip pass must run AFTER
-        # the trim to see them, and a second trim restores the flat bottom
-        # that the strip's remesh blurred.
         _plate_trim_boolean(box, collection)
         if _strip_thin_features(box, collection, vox):
             _plate_trim_boolean(box, collection)
 
-        # Drop tiny loose shards (remesh dust / thin wedges).
         bm = bmesh.new()
         bm.from_mesh(box.data)
         _ensure_lookup(bm)
@@ -1711,10 +1462,6 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
             bpy.data.meshes.remove(out)
             raise RuntimeError("cradle vanished after cleanup")
 
-        # Final acceptance scan: a surviving feather (many NON-taper thin
-        # faces) disqualifies the cradle entirely - pillars take over.
-        # Taper creases (bowl rims etc.) are legitimate and excused, the
-        # same way the validator excuses them.
         abm = bmesh.new()
         abm.from_mesh(out)
         accept_bvh = BVHTree.FromBMesh(abm)
@@ -1724,8 +1471,6 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
             bpy.data.meshes.remove(out)
             raise RuntimeError("residual thin features")
 
-        # Contact bookkeeping: cradle covers everything except the
-        # tangent-zone leftovers, which the tree machinery takes.
         leftovers = []
         for k, (co, nrm) in enumerate(isl.samples):
             if k in leftover_idx:
@@ -1744,12 +1489,7 @@ def gen_cradle(isl: Island, metas, A: Analysis, P: Params, collection,
             _remove_object(cutters)
 
 
-# --------------------------------------------------------------------------
-# Assembly
-# --------------------------------------------------------------------------
-
 def finalize_soup(soup: PrimitiveSoup, P: Params, collection, name):
-    """Primitive soup -> voxel remesh -> manifold mesh (or None if empty)."""
     if soup.count == 0:
         soup.free()
         return None
@@ -1764,7 +1504,6 @@ def finalize_soup(soup: PrimitiveSoup, P: Params, collection, name):
     bm = bmesh.new()
     bm.from_mesh(ob.data)
     _ensure_lookup(bm)
-    # Remove dust shells smaller than a couple of voxels.
     seen = set()
     for v in bm.verts:
         if v.index in seen:
@@ -1804,9 +1543,6 @@ def merge_meshes(meshes, name):
 
 def _count_nontaper_thin(bm, bvh, wall_floor=0.8, stack_floor=0.4,
                          stop_at=9):
-    """Count thin faces that are NOT taper creases (same discrimination the
-    validator uses): a wedge has thick material 1 mm to the side, a genuine
-    feather/sheet stays thin everywhere."""
     def thickness(o, n):
         h = bvh.ray_cast(o - n * 0.04, -n)
         if h[0] is None:
@@ -1848,10 +1584,6 @@ def _count_nontaper_thin(bm, bvh, wall_floor=0.8, stack_floor=0.4,
 
 
 def _strip_thin_features(ob, collection, vox, floor=0.45, rounds=2):
-    """Measure per-face thickness on the object's mesh and delete any
-    hair-thin spots (plus a small halo), then re-remesh. Displacement-based
-    erosion keeps recreating ~0.1 mm feather lips at convex crease rings -
-    direct measurement and removal is the reliable last word."""
     did = False
     for _ in range(rounds):
         me = ob.data
@@ -1889,12 +1621,6 @@ def _strip_thin_features(ob, collection, vox, floor=0.45, rounds=2):
 
 
 def _carve_collisions(sup_me, A, P, collection, max_rounds=2):
-    """Self-repair for residual model collisions: delete exactly the
-    overlapping support faces (plus a 1 mm halo) and re-remesh, which
-    closes the wound pulled back from the model. The per-primitive
-    clearance checks catch almost everything; this is the systemic
-    backstop for the long tail of grazing configurations. Returns the
-    (possibly replaced) mesh."""
     me = sup_me
     for _ in range(max_rounds):
         bm = bmesh.new()
@@ -1926,7 +1652,7 @@ def _carve_collisions(sup_me, A, P, collection, max_rounds=2):
         _apply_modifiers_inplace(ob)
         _plate_trim_boolean(ob, collection)
         new_me = ob.data
-        bpy.data.objects.remove(ob)   # keep the mesh datablock
+        bpy.data.objects.remove(ob)
         if me is not sup_me and me.users == 0:
             bpy.data.meshes.remove(me)
         me = new_me
@@ -1934,10 +1660,6 @@ def _carve_collisions(sup_me, A, P, collection, max_rounds=2):
 
 
 def _plate_trim_boolean(ob, collection):
-    """Trim everything below z=0 with an exact boolean intersect against a
-    half-space box. Geometry is built running through the plate on purpose
-    (a surface lying exactly ON z=0 destabilizes the voxel remesh, and a
-    bmesh cap fill cannot handle nested cut loops - a boolean can)."""
     me = ob.data
     if not me.vertices:
         return
@@ -1966,12 +1688,7 @@ def _plate_trim_boolean(ob, collection):
     _remove_object(box_ob)
 
 
-# --------------------------------------------------------------------------
-# Validation
-# --------------------------------------------------------------------------
-
 def validate(support_me, A: Analysis, all_samples, P: Params):
-    """Returns dict of checks. all_samples: [(co, coverage_radius, strategy)]"""
     V = {}
     bm = bmesh.new()
     bm.from_mesh(support_me)
@@ -1992,7 +1709,6 @@ def validate(support_me, A: Analysis, all_samples, P: Params):
 
     sup_bvh = BVHTree.FromBMesh(bm)
 
-    # Self-intersection: overlapping face pairs that do not share vertices.
     overlap = sup_bvh.overlap(sup_bvh)
     bm.faces.ensure_lookup_table()
     bad_pairs = 0
@@ -2007,8 +1723,6 @@ def validate(support_me, A: Analysis, all_samples, P: Params):
         bad_pairs += 1
     V["self_intersection"] = {"pass": bad_pairs == 0, "bad_pairs": bad_pairs}
 
-    # Collision with the model: with a built-in air gap there must be NO
-    # overlapping face pairs at all.
     col = sup_bvh.overlap(A.bvh) if A.bvh else []
     col_locs = []
     for (i, j) in col[:6]:
@@ -2019,8 +1733,6 @@ def validate(support_me, A: Analysis, all_samples, P: Params):
                             "overlap_pairs": len(col),
                             "sample_locations": col_locs}
 
-    # Contact gap sanity: supports should come close under the contact
-    # points (gap window) - not fused, not missing.
     skip_strats = (STRAT_BRIDGE, STRAT_SEALED, "TIGHT")
     gaps = []
     for s in all_samples:
@@ -2038,7 +1750,6 @@ def validate(support_me, A: Analysis, all_samples, P: Params):
     else:
         V["contact_gap"] = {"pass": True, "min": None, "mean": None}
 
-    # Coverage: every needed sample must have support nearby.
     needed = 0
     covered = 0
     misses = []
@@ -2060,10 +1771,6 @@ def validate(support_me, A: Analysis, all_samples, P: Params):
         "sample_misses": misses[:8],
     }
 
-    # Minimum thickness: cast from face centers inward. Direction matters
-    # on FDM: roughly horizontal rays measure WALL thickness (floor: two
-    # extrusion lines, 0.8 mm); steep rays measure stacked-layer thickness
-    # (floor: two layers, 0.4 mm) - a wide 0.6 mm thick foot disc is fine.
     rng = random.Random(P.seed + 7)
     faces = bm.faces[:]
     n_take = min(700, len(faces))
@@ -2077,10 +1784,6 @@ def validate(support_me, A: Analysis, all_samples, P: Params):
         return None if t > 60.0 else t
 
     def _is_taper_tip(c, n, floor):
-        """A crease/wedge measures near-zero right AT its line yet prints
-        fine - the slicer simply quantizes the taper. Distinguish from a
-        genuine thin sheet: probe 1 mm to the sides; a wedge has thick
-        material next door, a sheet stays thin everywhere."""
         t1 = n.cross(Vector((0, 0, 1)))
         if t1.length < 0.1:
             t1 = n.cross(Vector((1, 0, 0)))
@@ -2140,12 +1843,7 @@ def validate(support_me, A: Analysis, all_samples, P: Params):
     return V
 
 
-# --------------------------------------------------------------------------
-# Print profile recommendation
-# --------------------------------------------------------------------------
-
 def model_min_wall(A: Analysis, P: Params, n_rays=200):
-    """Approximate the model's own thinnest wall by inward ray casting."""
     rng = random.Random(P.seed + 13)
     polys = A.me.polygons
     if not polys:
@@ -2180,7 +1878,6 @@ def recommend_profile(A: Analysis, P: Params, strat_counts, validation):
     min_wall = model_min_wall(A, P)
     max_dim = max(dims)
 
-    # Layer height.
     if (min_wall is not None and min_wall < 1.5) or max_dim < 30.0:
         layer = 0.12
         why_layer = "fine detail (thin walls or small model)"
@@ -2291,7 +1988,6 @@ def recommend_profile(A: Analysis, P: Params, strat_counts, validation):
         "name": "FDM Wizard 0.20 %s" % P.printer,
         "inherits": "0.20mm Standard %s" % inherit_sfx,
     }
-    # Use the closest standard base profile for the chosen layer height.
     base_by_layer = {0.12: "0.12mm Fine", 0.16: "0.16mm Optimal",
                      0.20: "0.20mm Standard", 0.24: "0.24mm Draft"}
     base = base_by_layer.get(layer, "0.20mm Standard")
@@ -2304,25 +2000,10 @@ def recommend_profile(A: Analysis, P: Params, strat_counts, validation):
             "layer_height": layer, "min_wall": min_wall}
 
 
-# --------------------------------------------------------------------------
-# Pipeline
-# --------------------------------------------------------------------------
-
-# --------------------------------------------------------------------------
-# PIN style - Lychee-like branching supports, sized for FDM. One cone tip
-# per support point, short Y-forks that merge neighbouring tips, vertical
-# posts, cone feet + pad discs on the bed (or a small cone foot resting on
-# the model when the bed below is blocked), and cross-braces on tall posts.
-# Tips embed pin_overlap into the model; the boolean conform then trims
-# every part flush at the model surface, so nothing is left inside it.
-# Shares the analyze() front-end (bed guard, dense proxy, profile).
-# --------------------------------------------------------------------------
-
 _DOWN = Vector((0.0, 0.0, -1.0))
 
 
 class _PinNode:
-    """A point that carries load downward: a tip bottom or a fork junction."""
     __slots__ = ("p", "load", "children", "rest_z", "on_model")
 
     def __init__(self, p, load, children, rest_z, on_model):
@@ -2338,8 +2019,6 @@ def _pins_radius(load, P: Params):
 
 
 def _pins_clear(bvh, a, b, r):
-    """True if a rod of radius r from a to b misses the model
-    (centre ray + four rim rays)."""
     d = b - a
     L = d.length
     if L < 1e-4:
@@ -2357,8 +2036,6 @@ def _pins_clear(bvh, a, b, r):
 
 
 def _pins_drop(bvh, p, r):
-    """Where a vertical post of radius r below p lands: (z, on_model).
-    z = 0.0 and on_model False means it reaches the bed."""
     best, on_model = 0.0, False
     for ox, oy in ((0.0, 0.0), (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)):
         hit = bvh.ray_cast(Vector((p.x + ox, p.y + oy, p.z)), _DOWN)
@@ -2368,7 +2045,6 @@ def _pins_drop(bvh, p, r):
 
 
 def _pins_downsample(points, spacing):
-    """Keep one point per `spacing` (KDTree, input order = priority)."""
     if not points or spacing <= 0:
         return list(points)
     kd = KDTree(len(points))
@@ -2388,14 +2064,9 @@ def _pins_downsample(points, spacing):
 
 
 def _pins_make_tips(points, P: Params, bvh):
-    """One tip per point. Returns (tips, nodes, n_dropped).
-    tip = (contact, top_inside_model, bottom, island_idx, kind) where kind
-    is "node" (cone tip feeding the fork/post network), "pad" (low point:
-    cone straight onto a bed pad) or "bridge" (model directly below and
-    close: a short double-cone rod from model to model)."""
     tip_len = P.pin_base_length
     r_b = P.pin_branch_d * 0.5
-    r_mid = (P.pin_diameter * 0.5 + r_b) * 0.5   # cone is thin near contact
+    r_mid = (P.pin_diameter * 0.5 + r_b) * 0.5
     floor_z = P.pad_h + P.foot_h
     tips, nodes, dropped = [], [], 0
     for co, nrm, iid in points:
@@ -2406,17 +2077,13 @@ def _pins_make_tips(points, P: Params, bvh):
             tips.append((co, top, bot, iid, "bridge"))
             continue
         bot = None
-        # Perpendicular to the surface (leaning toward down), else vertical;
-        # full-length cone first, then a short one for tight spots.
         for L in (tip_len, tip_len * 0.6):
             for d in ((nrm + _DOWN * 0.35).normalized(), _DOWN):
-                if d.z > -0.5:          # never lean more than 60 deg
+                if d.z > -0.5:
                     continue
                 cand = co + d * L
                 if cand.z < floor_z:
                     continue
-                # Start past the contact patch: a vertical cone's rim rays
-                # would otherwise graze the sloped surface it stands on.
                 if _pins_clear(bvh, co + d * (0.6 + r_mid), cand,
                                 r_mid + P.clearance):
                     bot = cand
@@ -2424,7 +2091,6 @@ def _pins_make_tips(points, P: Params, bvh):
             if bot is not None:
                 break
         if bot is None and co.z <= floor_z + tip_len:
-            # Low point: the tip itself runs straight down onto the pad.
             tips.append((co, top, Vector((co.x, co.y, P.pad_h * 0.5)), iid,
                          "pad"))
             continue
@@ -2433,7 +2099,6 @@ def _pins_make_tips(points, P: Params, bvh):
             continue
         rest_z, on_model = _pins_drop(bvh, bot, r_b + P.clearance)
         if on_model and bot.z - rest_z < 1.0:
-            # Tip bottom almost on the model below: rod straight down.
             tips.append((co, top, Vector((bot.x, bot.y,
                                           rest_z - P.pin_overlap)),
                          iid, "bridge"))
@@ -2444,24 +2109,17 @@ def _pins_make_tips(points, P: Params, bvh):
 
 
 def _pins_route_to_bed(nodes, P: Params, bvh):
-    """A node whose vertical drop lands on the model tries a dog-leg first:
-    lean out at fork_angle in 8 directions and drop again from there. The
-    shortest leg that reaches the bed wins; the old node becomes its child.
-    Keeps scars off the model (Lychee routes around the same way)."""
     tan_f = tan(radians(P.fork_angle))
     floor_z = P.pad_h + P.foot_h + 1.0
     dirs = [Vector((cos(a), sin(a), 0.0))
             for a in [k * math.pi / 4 for k in range(8)]]
     out = []
     for n in nodes:
-        # A short rest on the model beats a long post from the bed.
         if not n.on_model or n.p.z - n.rest_z < P.rest_ratio * n.p.z:
             out.append(n)
             continue
         r = _pins_radius(n.load, P)
         best = None
-        # Short knees only: Lychee bends a post 2-6 mm near the top; a
-        # longer lean reads as an arch and wobbles - rest on the model.
         for h in (2.0, 4.0, 6.0):
             for d in dirs:
                 q = n.p + d * h + _DOWN * (h / tan_f)
@@ -2484,8 +2142,6 @@ def _pins_route_to_bed(nodes, P: Params, bvh):
 
 
 def _pins_merge(nodes, P: Params, bvh):
-    """Rounds of greedy pairing: close nodes join at a junction below
-    them (Y-fork) when both branches and the post below are clear."""
     tan_f = tan(radians(P.fork_angle))
     floor_z = P.pad_h + P.foot_h + 1.0
     active = list(nodes)
@@ -2525,7 +2181,6 @@ def _pins_merge(nodes, P: Params, bvh):
             rest_z, on_model = _pins_drop(bvh, J, r + P.clearance)
             if jz - rest_z < 2.0:
                 continue
-            # Never turn bed-standing posts into one that scars the model.
             if on_model and not (a.on_model or b.on_model):
                 continue
             if not _pins_clear(bvh, a.p, J,
@@ -2544,7 +2199,6 @@ def _pins_merge(nodes, P: Params, bvh):
 
 
 def _pins_build(tips, roots, P: Params, bvh):
-    """Emit every part into one PrimitiveSoup. Returns (mesh, n_braces)."""
     soup = PrimitiveSoup()
     r_pin = P.pin_diameter * 0.5
     r_b = P.pin_branch_d * 0.5
@@ -2557,7 +2211,6 @@ def _pins_build(tips, roots, P: Params, bvh):
 
     for co, top, bot, _iid, kind in tips:
         if kind == "bridge":
-            # Slim model-to-model rod: fat ones read as knobs on the model.
             mid = (co + bot) * 0.5
             r_m = min(r_b, r_pin * 1.3)
             soup.tube(top, mid, r_pin, r_m, segments=8)
@@ -2583,8 +2236,6 @@ def _pins_build(tips, roots, P: Params, bvh):
         r = _pins_radius(n.load, P)
         x, y = n.p.x, n.p.y
         if n.on_model:
-            # Post down to the model, then a cone foot that embeds and is
-            # trimmed flush like a tip.
             knee = Vector((x, y, n.rest_z + P.pin_base_length * 0.6))
             if knee.z < n.p.z:
                 soup.tube(n.p, knee, r, r, segments=8)
@@ -2609,7 +2260,6 @@ def _pins_build(tips, roots, P: Params, bvh):
 
 
 def _pins_neighbour_pairs(xy, max_d, k=3):
-    """Unique index pairs of each point's k nearest neighbours within max_d."""
     if len(xy) < 2:
         return []
     kd = KDTree(len(xy))
@@ -2625,15 +2275,13 @@ def _pins_neighbour_pairs(xy, max_d, k=3):
 
 
 def _pins_raft(soup, feet, P: Params):
-    """Join neighbouring pads with flat bars so the bed footprint is one
-    raft (Lychee's merged-disc base) instead of loose discs."""
     w = P.pad_d * 0.5
     for i, j in _pins_neighbour_pairs(feet, P.raft_join, k=2):
         a, b = feet[i], feet[j]
         d = b - a
         L = d.length
         if L < P.pad_d * 0.9:
-            continue                    # discs already overlap
+            continue
         mid = (a + b) * 0.5
         ang = math.atan2(d.y, d.x)
         mat = (Matrix.Translation(Vector((mid.x, mid.y, P.pad_h * 0.5)))
@@ -2643,8 +2291,6 @@ def _pins_raft(soup, feet, P: Params):
 
 
 def _pins_truss(soup, posts, P: Params, bvh, floor_z):
-    """X-braces between neighbouring bed posts, one bay every brace_step
-    up to just below the lower post's top. Returns the brace count."""
     r = P.brace_d * 0.5
     xy = [Vector((n.p.x, n.p.y, 0.0)) for n in posts]
     n_braces = 0
@@ -2654,7 +2300,6 @@ def _pins_truss(soup, posts, P: Params, bvh, floor_z):
             continue
         top = min(a.z, b.z) - 1.0
         z0 = floor_z + 1.0
-        # Tall posts get taller bays, never more than brace_max_bays.
         step = max(P.brace_step, (top - z0) / P.brace_max_bays)
         while top - z0 >= P.brace_min_h * 0.5:
             z1 = min(z0 + step, top)
@@ -2669,9 +2314,6 @@ def _pins_truss(soup, posts, P: Params, bvh, floor_z):
 
 
 def _pins_conform(sup_ob, model_ob, solver, collection):
-    """Boolean DIFFERENCE (supports - model) to trim embedded tips flush.
-    Falls back through solvers; returns True on success. Uses the
-    operator-free modifier bake so no viewport context is needed."""
     order = {"MANIFOLD": ["MANIFOLD", "EXACT"],
              "EXACT": ["EXACT", "MANIFOLD"],
              "FLOAT": ["FLOAT", "MANIFOLD"]}.get(solver, [solver])
@@ -2689,9 +2331,6 @@ def _pins_conform(sup_ob, model_ob, solver, collection):
         mod.object = model_ob
         try:
             _apply_modifiers_inplace(sup_ob)
-            # An unchanged face count means the solver bailed out (e.g.
-            # Manifold refusing a non-manifold model) - the embedded tips
-            # always change the topology when the trim really happens.
             n = len(sup_ob.data.polygons)
             if n > 0 and n != n_base:
                 if base.users == 0:
@@ -2699,7 +2338,6 @@ def _pins_conform(sup_ob, model_ob, solver, collection):
                 return True
         except Exception:
             pass
-        # restore and try next solver
         if sup_ob.data is not base:
             dead = sup_ob.data
             sup_ob.data = base
@@ -2710,9 +2348,6 @@ def _pins_conform(sup_ob, model_ob, solver, collection):
 
 
 def _pins_validate(sup_me, A: Analysis, covered, n_dropped, P: Params):
-    """Geometry + COVERAGE: every supportable island must carry at least
-    one tip. Model collision/contact gap are intentionally NOT checked -
-    tips embed by design and the conform trims them flush."""
     need = [i for i in A.islands
             if not i.sealed and i.samples and i.area >= 1.0]
     missing = [i for i in need if i.idx not in covered]
@@ -2733,10 +2368,6 @@ def _pins_validate(sup_me, A: Analysis, covered, n_dropped, P: Params):
 
 
 def _pins_local_minima(A: Analysis, P: Params):
-    """Mesh vertices that are the lowest point within minima_radius: the
-    start of a new island when the print is sliced (cloak tips, fingers,
-    strap ends). They need a tip whatever the surface angle - the overhang
-    test alone misses shallow ones. Returns [(co, normal, -1)]."""
     import numpy as np
     me = A.me
     nv = len(me.vertices)
@@ -2764,18 +2395,14 @@ def _pins_local_minima(A: Analysis, P: Params):
         p = Vector(co[i])
         if any(z[j] < z[i] - 1e-4
                for _c, j, _d in kd.find_range(p, P.minima_radius)):
-            continue                    # a bump, not a true low point
+            continue
         if point_inside_solid(A.bvh, p + Vector((0.0, 0.0, -0.3))):
-            continue                    # resting on the model already
+            continue
         out.append((p, Vector(me.vertices[int(i)].normal), -1))
     return out
 
 
 def run_pins_pipeline(obj, P, A, collection, report, dropped):
-    """Pin-style geometry from the analyze() result A. Returns
-    (sup_mesh_or_None, strat_counts, validation)."""
-    # Overhang contact points from every supportable island (sealed voids
-    # are skipped - a support there could never be removed).
     pts = []
     n_sealed = 0
     for isl in A.islands:
@@ -2788,7 +2415,6 @@ def run_pins_pipeline(obj, P, A, collection, report, dropped):
             "%d sealed internal region(s) skipped - a support there could "
             "never be removed." % n_sealed)
 
-    # Local minima first: they are mandatory, island samples fill in.
     minima = _pins_local_minima(A, P)
     pts = _pins_downsample(minima + pts, P.pin_spacing)
     tips, nodes, n_dropped = _pins_make_tips(pts, P, A.bvh)
@@ -2808,8 +2434,6 @@ def run_pins_pipeline(obj, P, A, collection, report, dropped):
               + sum(1 for t in tips if t[4] == "bridge"))
     strat_counts = {"PINS": len(tips)}
 
-    # Boolean conform against the REAL model (not the decimated analysis
-    # proxy) so the trim is flush with what actually prints.
     conformed = False
     if P.conform != "NONE":
         tmp_sup = _new_object("FDMW_pins_tmp", sup_me, collection)
@@ -2829,9 +2453,6 @@ def run_pins_pipeline(obj, P, A, collection, report, dropped):
                 "%.1f mm - the slicer trims them at print time."
                 % P.pin_overlap)
 
-    # An island counts as covered when a built tip sits on it OR within
-    # one tip spacing of one of its samples (the downsample may have
-    # handed its spot to a neighbouring island's tip).
     covered = {t[3] for t in tips}
     kd = KDTree(len(tips))
     for k, t in enumerate(tips):
@@ -2862,18 +2483,6 @@ def run_pins_pipeline(obj, P, A, collection, report, dropped):
     return sup_me, strat_counts, val
 
 
-# --------------------------------------------------------------------------
-# CLEAR style - pins that touch the model ONLY at their tip contacts.
-# FDM fuses any support side that runs close along a wall ("snakes"
-# climbing the model), so every post, branch, brace and pad keeps
-# `keepout` from the model. Routing runs on a voxel grid:
-#   forbidden = model surface dilated by (max post radius + keepout)
-#   R[k]      = cells that can reach the bed going down, leaning at most
-#               fork_angle (one 4-neighbour step per layer, h = c/tan)
-# Tips whose node cannot reach the bed are reported, never rested on the
-# model. Tip cones embed + boolean-trim like PINS (twist-off contacts).
-# --------------------------------------------------------------------------
-
 class _ClearGrid:
     __slots__ = ("x0", "y0", "z0", "c", "h", "shape", "forbid", "R",
                  "pad_forbid")
@@ -2894,13 +2503,11 @@ class _ClearGrid:
                        self.z0 + k * self.h))
 
     def blocked(self, p):
-        """True if a support centred at p would break the keep-out."""
         cl = self.cell(p)
         return cl is None or bool(self.forbid[cl])
 
 
 def _clear_surface_points(me, step):
-    """Dense point samples of every triangle (spacing <= step)."""
     import numpy as np
     me.calc_loop_triangles()
     nv = len(me.vertices)
@@ -2944,17 +2551,12 @@ def _dilate_xy_step(a, diag):
 
 
 def _dilate_xy(a, k):
-    """k rings of dilation on axes 0/1, alternating 8- and 4-neighbour
-    steps (octagon: never smaller than a disc of radius k cells)."""
     for r in range(k):
         a = _dilate_xy_step(a, r % 2 == 0)
     return a
 
 
 def _dilate_ball(surf, D, c, h):
-    """Cells whose centre may lie within D of a surface cell: an
-    ellipsoid-ish stack - wide rings at the surface layer, narrower above
-    and below - instead of a box. Index rounding is padded."""
     import numpy as np
     kz = int(math.ceil((D + 0.5 * h) / h))
     need = {}
@@ -2980,8 +2582,6 @@ def _dilate_ball(surf, D, c, h):
 
 def _clear_build_grid(A: Analysis, P: Params):
     import numpy as np
-    # Sized for a single-tip post; merged trunks are at most
-    # (pillar_diameter - pin_branch_d)/2 fatter, eaten from the keep-out.
     D = P.pin_branch_d * 0.5 + P.keepout
     pad_r = P.pad_d * 0.5
     floor_z = P.pad_h + P.foot_h
@@ -3010,8 +2610,6 @@ def _clear_build_grid(A: Analysis, P: Params):
     surf[ii, jj, kk] = True
     G.forbid = _dilate_ball(surf, D, c, h)
 
-    # Bed pads (radius pad_r, up to floor_z) keep the keep-out from the
-    # model where it stands on the plate.
     low = pts[:, 2] < floor_z + P.keepout
     pad2d = np.zeros((nx, ny), dtype=bool)
     pad2d[ii[low], jj[low]] = True
@@ -3034,7 +2632,6 @@ def _clear_build_grid(A: Analysis, P: Params):
 
 
 def _clear_cone_ok(bvh, co, d, L, r_tip, r_base):
-    """Tip cone co -> co+d*L stays off the model past its contact patch."""
     t = 1.2
     while t <= L + 1e-6:
         p = co + d * t
@@ -3046,7 +2643,6 @@ def _clear_cone_ok(bvh, co, d, L, r_tip, r_base):
     return True
 
 
-# Fallback tip directions: leans of 20/40/55 deg from straight down, 8 ways.
 _TIP_SWEEP = [Vector((sin(radians(a)) * cos(radians(b)),
                       sin(radians(a)) * sin(radians(b)),
                       -cos(radians(a))))
@@ -3054,10 +2650,6 @@ _TIP_SWEEP = [Vector((sin(radians(a)) * cos(radians(b)),
 
 
 def _clear_tips(points, P: Params, A: Analysis, G: _ClearGrid):
-    """Returns (tips, unreachable). tip = dict(co, top, node, cell, kind,
-    iid, L). kind "route" feeds the grid router, "foot" is a low point
-    whose cone runs straight to a small bed foot. Also returns the count
-    of points under 1 mm above the pad (left to the first layers)."""
     r_pin, r_b = P.pin_diameter * 0.5, P.pin_branch_d * 0.5
     floor_z = G.z0
     tips, unreachable = [], []
@@ -3070,7 +2662,7 @@ def _clear_tips(points, P: Params, A: Analysis, G: _ClearGrid):
         for L in (P.pin_base_length, P.pin_base_length * 1.5,
                   P.pin_base_length * 2.0, P.pin_base_length * 2.7):
             for d in dirs:
-                if d.z > -0.5:              # never lean more than 60 deg
+                if d.z > -0.5:
                     continue
                 node = co + d * L
                 if node.z < floor_z:
@@ -3086,12 +2678,9 @@ def _clear_tips(points, P: Params, A: Analysis, G: _ClearGrid):
             if found:
                 break
         if found is None and co.z < P.pad_h + 1.0:
-            near_bed += 1           # first layers print this, no support
+            near_bed += 1
             continue
         if found is None and co.z <= floor_z + 3.0 * P.pin_base_length:
-            # Low wedge (e.g. under a ball near the bed): no room for a
-            # post, so one cone runs from the contact straight to a small
-            # foot on the bed, leaning away from the surface.
             foot_r = r_b * 1.6
             for d in [(nrm + _DOWN * 0.35).normalized(),
                       (nrm + _DOWN).normalized(), _DOWN] + _TIP_SWEEP:
@@ -3117,13 +2706,9 @@ def _clear_tips(points, P: Params, A: Analysis, G: _ClearGrid):
 
 
 def _clear_route(tips, G: _ClearGrid, merge_reach=4.0):
-    """Descend every routed tip to the bed through R. Highest tips first;
-    later paths join an earlier one as soon as it is one step away.
-    Returns (parent, load): cell -> lower cell (None at the bed), and the
-    number of tips carried through each cell."""
     nx, ny, _nz = G.shape
     parent, load = {}, {}
-    used = {}                       # layer -> set of (i, j) already routed
+    used = {}
     reach = max(1, int(round(merge_reach / G.c)))
     for t in sorted((t for t in tips if t["kind"] == "route"),
                     key=lambda t: -t["node"].z):
@@ -3146,9 +2731,6 @@ def _clear_route(tips, G: _ClearGrid, merge_reach=4.0):
             if joined:
                 q = joined[0]
             else:
-                # Lean toward the nearest routed post below (within
-                # merge_reach) so neighbours merge into trees instead of
-                # standing as a forest of separate sticks.
                 q = cand[0]
                 row = used.get(k - 1)
                 if row:
@@ -3180,8 +2762,6 @@ def _clear_segment_free(G, a, b, step=0.4):
 
 
 def _clear_build(tips, parent, load, G: _ClearGrid, P: Params):
-    """Emit tips, routed posts, feet, pads, raft bars and braces.
-    Returns (mesh, n_posts, n_braces)."""
     soup = PrimitiveSoup()
     r_pin, r_b = P.pin_diameter * 0.5, P.pin_branch_d * 0.5
     pad_r = P.pad_d * 0.5
@@ -3244,7 +2824,6 @@ def _clear_build(tips, parent, load, G: _ClearGrid, P: Params):
                   min(r * 1.6, pad_r), r, segments=12)
         pad(cen.x, cen.y)
         feet.append(Vector((cen.x, cen.y, 0.0)))
-        # Straight vertical run above the foot = a brace-able post.
         top = c
         while len(children.get(top, [])) == 1:
             ch = children[top][0]
@@ -3253,8 +2832,6 @@ def _clear_build(tips, parent, load, G: _ClearGrid, P: Params):
             top = ch
         posts.append((cen, G.center(top).z))
 
-    # Raft bars join neighbouring pads - only where the bar footprint keeps
-    # clear of the model's base.
     w = P.pad_d * 0.5
     for i, j in _pins_neighbour_pairs(feet, P.raft_join, k=2):
         a, b = feet[i], feet[j]
@@ -3280,7 +2857,6 @@ def _clear_build(tips, parent, load, G: _ClearGrid, P: Params):
                @ Matrix.Diagonal(Vector((L, w, P.pad_h, 1.0))))
         soup.box(mat)
 
-    # X-braces between neighbouring straight posts.
     rb = P.brace_d * 0.5
     n_braces = 0
     xy = [Vector((p[0].x, p[0].y, 0.0)) for p in posts]
@@ -3305,9 +2881,6 @@ def _clear_build(tips, parent, load, G: _ClearGrid, P: Params):
 
 
 def _clear_keepout(sup_me, obj, tips, P: Params):
-    """Smallest gap between the support surface and the REAL model,
-    ignoring each tip cone (it touches by design). Long edges are sampled
-    so a tube running along a wall is caught between its end rings."""
     import numpy as np
     model_me = extract_world_mesh(obj)
     bvh = build_bvh(model_me)
@@ -3342,7 +2915,6 @@ def _clear_keepout(sup_me, obj, tips, P: Params):
                 _c, k, dist = kd.find(v)
                 if dist <= tips[k]["L"] + P.pin_branch_d + 0.6:
                     continue
-                # A neighbouring tip may own this point instead.
                 if any(dd <= tips[kk]["L"] + P.pin_branch_d + 0.6
                        for _cc, kk, dd in kd.find_range(v, excl)):
                     continue
@@ -3361,8 +2933,6 @@ def _clear_keepout(sup_me, obj, tips, P: Params):
 
 
 def run_clear_pipeline(obj, P, A, collection, report, dropped):
-    """CLEAR-style geometry. Returns (sup_mesh_or_None, strat_counts,
-    validation)."""
     pts = []
     n_sealed = 0
     for isl in A.islands:
@@ -3458,8 +3028,6 @@ def run_clear_pipeline(obj, P, A, collection, report, dropped):
 
 
 def run_pipeline(obj, P: Params, collection=None):
-    """Full run on one mesh object. Returns a report dict; creates a
-    SUP_<name> object next to the model (replacing any previous one)."""
     t0 = time.time()
     if obj is None or obj.type != 'MESH':
         raise RuntimeError("Select a mesh object first")
@@ -3468,15 +3036,11 @@ def run_pipeline(obj, P: Params, collection=None):
 
     report = {"object": obj.name, "messages": [], "attempts": []}
 
-    # Remove previous output for this object.
     old_name = "SUP_" + obj.name
     for ob in list(bpy.data.objects):
         if ob.name == old_name or ob.name.startswith(old_name + "."):
             _remove_object(ob)
 
-    # Bed-fit guard BEFORE any heavy work: a model far beyond the bed
-    # would burn minutes growing meter-scale supports that could never
-    # print. Refuse fast, with the fix spelled out.
     me_chk = extract_world_mesh(obj)
     if not me_chk.vertices:
         bpy.data.meshes.remove(me_chk)
@@ -3501,10 +3065,6 @@ def run_pipeline(obj, P: Params, collection=None):
     _fix_inside_out(obj, report["messages"])
     dropped = drop_to_plate(obj, report["messages"])
 
-    # Very dense meshes: run the whole analysis against a decimated proxy
-    # (C-speed decimate) - overhang islands on a 0.1 mm-triangle scan are
-    # found just as well at ~250k triangles, without minutes of Python
-    # loops over a million faces.
     analysis_obj = obj
     proxy = None
     me_cnt = _evaluated_mesh_of(obj)
@@ -3531,18 +3091,11 @@ def run_pipeline(obj, P: Params, collection=None):
     for attempt in range(P.max_retries + 1):
         A = analyze(analysis_obj, P_try)
         A.dropped_by = dropped
-        # Tall models: coarser descent steps keep tree growth bounded
-        # (same branch angles - lateral limit scales with the step), and
-        # a coarser remesh voxel keeps the final union tractable. The
-        # voxel stays at or below min_feature/2.5 so the printability
-        # floor still holds.
         P_try.step_dz = max(P_try.step_dz, A.model_h / 150.0)
         P_try.voxel_size = min(max(P_try.voxel_size, A.model_h / 600.0),
                                P_try.min_feature / 2.5)
         classify(A, P_try)
 
-        # PIN style: the original twist-off generator. Deterministic - one
-        # pass, no air-gap retry loop.
         if P_try.style in ("PINS", "CLEAR"):
             run = (run_clear_pipeline if P_try.style == "CLEAR"
                    else run_pins_pipeline)
@@ -3624,7 +3177,6 @@ def run_pipeline(obj, P: Params, collection=None):
             sup_me.name = "SUP_" + obj.name
 
         if sup_me is None:
-            # Nothing needed (or everything bridged/sealed).
             val = {"all_pass": True,
                    "manifold": {"pass": True, "note": "no geometry needed"},
                    "coverage": {"pass": True, "needed": 0, "covered": 0,
@@ -3661,7 +3213,6 @@ def run_pipeline(obj, P: Params, collection=None):
         if val["all_pass"]:
             break
 
-        # Auto-repair: open the gap / refine the voxel and try again.
         if attempt < P.max_retries:
             bpy.data.meshes.remove(sup_me)
             if not val.get("model_collision", {}).get("pass", True) or \
@@ -3670,18 +3221,13 @@ def run_pipeline(obj, P: Params, collection=None):
                 P_try.cradle_gap += 0.10
                 P_try.xy_clearance += 0.2
                 if attempt >= 1:
-                    # Last resort: trees route around geometry that the
-                    # straight strategies keep hitting.
                     P_try.strategy_override = "TREE"
             if not val.get("min_thickness", {}).get("pass", True):
-                # 0.24 floor: finer voxels destabilize the remesh on
-                # large soups (observed: boundary holes below that).
                 P_try.voxel_size = max(0.24, P_try.voxel_size - 0.06)
                 P_try.tip_contact_d = max(P_try.tip_contact_d, 1.3)
             if not val.get("coverage", {}).get("pass", True):
                 P_try.base_spacing = max(2.0, P_try.base_spacing * 0.85)
             if not val.get("manifold", {}).get("pass", True):
-                # Coarser voxels stabilize the remesh on dense soups.
                 P_try.voxel_size = min(0.42, P_try.voxel_size + 0.05)
             bpy.data.meshes.remove(A.me)
 
@@ -3726,10 +3272,6 @@ def run_pipeline(obj, P: Params, collection=None):
     return report
 
 
-# --------------------------------------------------------------------------
-# Report / file output helpers
-# --------------------------------------------------------------------------
-
 def write_report_text(report):
     name = "FDMW_Report_%s" % report["object"]
     txt = bpy.data.texts.get(name)
@@ -3767,7 +3309,6 @@ def write_report_text(report):
 
 
 def export_stls(obj, sup_ob, directory):
-    """Two STLs in the same world position; returns the file paths."""
     os.makedirs(directory, exist_ok=True)
     paths = []
     pairs = [(obj, "_model"), (sup_ob, "_supports")] if sup_ob \
@@ -3812,27 +3353,13 @@ def write_profile_files(report, directory):
     return [jp, mp]
 
 
-# --------------------------------------------------------------------------
-# UI (VibeCut panel + operators)
-# --------------------------------------------------------------------------
-
 _LAST_REPORT = {}
 
-
-# --------------------------------------------------------------------------
-# Overhang heat map - colorize a mesh by how steep each face's overhang is,
-# using the SAME threshold the support generator uses (so the yellow/red
-# line is exactly where supports kick in). Non-destructive: adds one color
-# attribute and flips the viewport to show it; Clear restores both.
-# --------------------------------------------------------------------------
 
 HEATMAP_ATTR = "VibeCut_Overhang"
 
 
 def _overhang_ramp(sev, threshold):
-    """Map per-face overhang severity (degrees, 0=vertical/up, 90=straight
-    down) to RGBA. Green (safe) -> yellow at the threshold -> orange ->
-    red (steep). Vectorized."""
     import numpy as np
     green = np.array([0.10, 0.70, 0.15])
     yellow = np.array([0.95, 0.88, 0.10])
@@ -3853,8 +3380,6 @@ def _overhang_ramp(sev, threshold):
 
 
 def build_overhang_heatmap(obj, threshold_deg):
-    """Write the VibeCut_Overhang color attribute on obj from world-space
-    face normals. Returns {'pct_supported', 'worst_deg'} or None."""
     import numpy as np
     me = obj.data
     F = len(me.polygons)
@@ -3863,7 +3388,6 @@ def build_overhang_heatmap(obj, threshold_deg):
     nrm = np.empty(F * 3, dtype=np.float64)
     me.polygons.foreach_get("normal", nrm)
     nrm = nrm.reshape(F, 3)
-    # World-space normals (handles a rotated/scaled object correctly).
     mw = np.array(obj.matrix_world)
     nm = np.linalg.inv(mw[:3, :3]).T
     wn = nrm @ nm.T
@@ -3871,8 +3395,6 @@ def build_overhang_heatmap(obj, threshold_deg):
     ln[ln < 1e-9] = 1.0
     wn /= ln[:, None]
     nz = wn[:, 2]
-    # severity: angle of the surface past vertical, exactly the support
-    # generator's metric (needs support when degrees(asin(-nz)) > angle).
     sev = np.degrees(np.arcsin(np.clip(-nz, 0.0, 1.0)))
 
     face_rgba = _overhang_ramp(sev, threshold_deg)
@@ -3947,7 +3469,6 @@ class VIBECUT_OT_overhang_heatmap(bpy.types.Operator):
 
         spaces = _viewport_spaces(ctx)
         if not p.hm_active and spaces:
-            # Save the current shading so Clear can restore it.
             s0 = spaces[0]
             p.hm_prev_type = s0.shading.type
             p.hm_prev_color = s0.shading.color_type
@@ -3970,7 +3491,6 @@ class VIBECUT_OT_clear_heatmap(bpy.types.Operator):
 
     def execute(self, ctx):
         p = ctx.scene.vibecut_supports
-        # Remove the attribute from every mesh that has it.
         for ob in bpy.data.objects:
             if ob.type != 'MESH':
                 continue
@@ -3978,7 +3498,6 @@ class VIBECUT_OT_clear_heatmap(bpy.types.Operator):
             if attr is not None:
                 ob.data.color_attributes.remove(attr)
                 ob.data.update()
-        # Restore viewport shading only if still in heatmap mode.
         for s in _viewport_spaces(ctx):
             if s.shading.color_type == 'VERTEX':
                 s.shading.color_type = p.hm_prev_color or 'OBJECT'
@@ -4084,7 +3603,6 @@ class VIBECUT_PG_supports(bpy.types.PropertyGroup):
         name="Seed", default=42,
         description="Random seed for tip placement (results are repeatable)")
     status: bpy.props.StringProperty(default="")
-    # Overhang heatmap state.
     hm_active: bpy.props.BoolProperty(default=False)
     hm_stats: bpy.props.StringProperty(default="")
     hm_prev_type: bpy.props.StringProperty(default="SOLID")
@@ -4104,7 +3622,6 @@ def _params_from_props(p) -> Params:
     P.voxel_size = p.voxel_size
     P.base_spacing = p.spacing
     P.seed = p.seed
-    # Pin-style params.
     P.pin_spacing = p.pin_spacing
     P.pin_diameter = p.pin_diameter
     P.pillar_diameter = p.pillar_diameter
@@ -4260,6 +3777,7 @@ class VIBECUT_PT_supports(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "VibeCut"
     bl_parent_id = "VIBECUT_PT_more"
+    bl_order = 2
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, ctx):
@@ -4271,7 +3789,6 @@ class VIBECUT_PT_supports(bpy.types.Panel):
         col.prop(p, "material")
         col.prop(p, "style")
 
-        # Overhang heatmap preview (uses the same Overhang Angle as supports)
         hbox = col.box()
         hrow = hbox.row(align=True)
         if p.hm_active:
@@ -4282,9 +3799,9 @@ class VIBECUT_PT_supports(bpy.types.Panel):
                 for chunk in p.hm_stats.split("  |  "):
                     hbox.label(text=chunk)
             leg = hbox.row(align=True)
-            leg.label(text="safe", icon='COLORSET_03_VEC')   # green
-            leg.label(text="threshold", icon='COLORSET_09_VEC')  # yellow
-            leg.label(text="steep", icon='COLORSET_01_VEC')  # red
+            leg.label(text="safe", icon='COLORSET_03_VEC')
+            leg.label(text="threshold", icon='COLORSET_09_VEC')
+            leg.label(text="steep", icon='COLORSET_01_VEC')
         else:
             hrow.operator("vibecut.overhang_heatmap",
                           text="Show Overhang Heatmap", icon='IMAGE_RGB')
@@ -4333,10 +3850,6 @@ class VIBECUT_PT_supports(bpy.types.Panel):
                        text="Remove Supports (%d)" % len(coll.objects),
                        icon='TRASH')
 
-
-# --------------------------------------------------------------------------
-# Registration (VibeCut convention: props first, classes second)
-# --------------------------------------------------------------------------
 
 classes = (
     VIBECUT_OT_generate_supports,

@@ -1,13 +1,3 @@
-# Headless validation suite for VibeCut's FDM Support Wizard (supports.py)
-# and the mesh_tools flatten/bevel helpers.
-#
-# Run with:
-#   blender -b --factory-startup -P tests/run_tests.py
-#
-# Eight support meshes (all in mm) cover the distinct support scenarios;
-# two extra cases exercise the native best-fit flatten and the bevel op.
-# Prints one CASE_RESULT json line per case and a SUITE_RESULT line.
-
 import importlib.util
 import json
 import math
@@ -18,6 +8,7 @@ import traceback
 
 import bpy
 import bmesh
+import numpy as np
 from mathutils import Matrix, Vector
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,10 +27,10 @@ fsw = _load("vibecut_supports_test", os.path.join(PKG, "supports.py"))
 mt = _load("vibecut_meshtools_test", os.path.join(PKG, "mesh_tools.py"))
 det = _load("vibecut_detection_test", os.path.join(PKG, "detection.py"))
 tl = _load("vibecut_tools_test", os.path.join(PKG, "tools.py"))
+cc = _load("vibecut_click_collapse_test",
+           os.path.join(PKG, "click_collapse.py"))
 hg = _load("vibecut_hinge_test", os.path.join(PKG, "hinge.py"))
 
-
-# ---------------------------------------------------------------- helpers
 
 def wipe_scene():
     for ob in list(bpy.data.objects):
@@ -83,8 +74,6 @@ def boolean_diff(name, build_base, build_cutter):
     bpy.context.view_layer.update()
     return base
 
-
-# ---------------------------------------------------------------- meshes
 
 def make_table():
     bm = bmesh.new()
@@ -145,8 +134,6 @@ def make_sphere():
                               matrix=Matrix.Translation((0, 0, 20)))
     return obj_from_bm(bm, "sphere")
 
-
-# ------------------------------------------------------------ expectations
 
 def check_case(name, rep, expect):
     fails = []
@@ -216,7 +203,7 @@ def run_support_cases(results):
         try:
             ob = builder()
             P = fsw.Params()
-            P.style = "SOLID"   # these cases assert the multi-strategy wizard
+            P.style = "SOLID"
             rep = fsw.run_pipeline(ob, P,
                                    collection=bpy.context.scene.collection)
             ok, fails = check_case(name, rep, expect)
@@ -255,10 +242,7 @@ def run_support_cases(results):
         sys.stdout.flush()
 
 
-# ------------------------------------------------------------ mesh tools
-
 def run_flatten_case(results):
-    """Bumpy tilted grid -> best-fit flatten -> verts must be coplanar."""
     wipe_scene()
     entry = {"case": "flatten_native"}
     try:
@@ -266,8 +250,6 @@ def run_flatten_case(results):
         rng = _r.Random(7)
         bm = bmesh.new()
         bmesh.ops.create_grid(bm, x_segments=12, y_segments=12, size=20.0)
-        # Tilt the grid and add bumpy noise so the best-fit plane is
-        # NOT axis-aligned (catches average-normal-style bias too).
         tilt = (Matrix.Rotation(math.radians(25), 4, 'X')
                 @ Matrix.Rotation(math.radians(15), 4, 'Y'))
         for v in bm.verts:
@@ -281,7 +263,6 @@ def run_flatten_case(results):
         mt._flatten_with_influence(verts, co, no, 1.0)
 
         worst = max(abs((v.co - co).dot(no)) for v in verts)
-        # The fitted plane should also be close to the known tilt plane.
         align = abs(no.dot(normal))
         bm.free()
         entry.update({
@@ -301,7 +282,6 @@ def run_flatten_case(results):
 
 
 def run_line_shape_cases(results):
-    """Straighten to Axis + Curve Line helpers on noisy edge chains."""
     import random as _r
     rng = _r.Random(2)
 
@@ -312,8 +292,6 @@ def run_line_shape_cases(results):
             bm.edges.new((a, b))
         return bm, vs
 
-    # Straighten to Axis: wobbly line along X under an object offset. Every
-    # vert must keep its world X and share one world Y/Z.
     entry = {"case": "straighten_to_axis"}
     try:
         bm, vs = chain([(i, 5 + rng.uniform(-.2, .2), 3 + rng.uniform(-.2, .2))
@@ -325,7 +303,6 @@ def run_line_shape_cases(results):
         dev = max(max(abs(c.y - w[0].y), abs(c.z - w[0].z)) for c in w)
         dx = max(abs(c.x - x) for c, x in zip(w, xs))
         bm.free()
-        # Z locked (move X/Y only): Y flattens, every vert keeps its own Z.
         bm2, vs2 = chain([(i, 5 + rng.uniform(-.2, .2), 3 + rng.uniform(-.2, .2))
                           for i in range(12)])
         zs = [v.co.z for v in vs2]
@@ -347,8 +324,6 @@ def run_line_shape_cases(results):
     results.append(entry)
     print("CASE_RESULT " + json.dumps(entry))
 
-    # Curve Line: noisy S-curve with 5 big outliers. All verts must land
-    # within the noise band of the true curve; the ends stay pinned.
     entry = {"case": "curve_line"}
     try:
         def truth(x):
@@ -377,7 +352,6 @@ def run_line_shape_cases(results):
 
 
 def run_bevel_case(results):
-    """Cube -> bevel all 12 edges -> manifold, more faces, no sharp 90s."""
     wipe_scene()
     entry = {"case": "auto_bevel"}
     try:
@@ -412,7 +386,6 @@ def run_bevel_case(results):
             "sharpest_remaining_deg": round(worst_angle, 1),
         })
 
-        # Modifier path: object-mode Auto Bevel settings on a real object.
         bm2 = bmesh.new()
         bmesh.ops.create_cube(bm2, size=20.0)
         ob = obj_from_bm(bm2, "bevel_mod_test")
@@ -437,10 +410,7 @@ def run_bevel_case(results):
     sys.stdout.flush()
 
 
-# ------------------------------------------------------------ detection
-
 def _add_capsule(bm, p1, p2, r, segs=16):
-    """Cylinder p1->p2 with sphere caps (round primitive for the creature)."""
     from mathutils import Vector as V
     d = V(p2) - V(p1)
     if d.length > 1e-6:
@@ -456,16 +426,9 @@ def _add_capsule(bm, p1, p2, r, segs=16):
 
 
 def make_creature():
-    """Quadruped with deliberate pinches at 4 hips + neck. Voxel-remeshed
-    dense (>100k verts) to mimic AI-generated scan STLs.
-    Returns (object, ground_truth_neck_positions)."""
     bm = bmesh.new()
-    # Torso: fat capsule along X at z=22 (surface reaches z~13.5 at y=7)
     _add_capsule(bm, (-16, 0, 22), (16, 0, 22), 11.0)
     gt = []
-    # 4 legs: a long thin hip pin (r 2.0) into a fat paw ball (r 5.5).
-    # The ball top (z 10.5) stays clear of the torso belly (z ~13.5 at
-    # y=7) so the pin is the only bridge - a decisive, unambiguous pinch.
     for sx in (-1, 1):
         for sy in (-1, 1):
             hx, hy = 11 * sx, 7 * sy
@@ -474,7 +437,6 @@ def make_creature():
                 bm, u_segments=16, v_segments=10, radius=5.5,
                 matrix=Matrix.Translation((hx, hy, 5)))
             gt.append(Vector((hx, hy, 12.0)))
-    # Neck (r 3.2) routed clear of the torso cap, into a separated head.
     _add_capsule(bm, (14, 0, 30), (28, 0, 38), 3.2, segs=12)
     bmesh.ops.create_uvsphere(bm, u_segments=20, v_segments=12, radius=8.0,
                               matrix=Matrix.Translation((33, 0, 41)))
@@ -484,7 +446,6 @@ def make_creature():
     bm.free()
     ob = bpy.data.objects.new("creature", me)
     bpy.context.scene.collection.objects.link(ob)
-    # Dense organic surface like a real scan
     r = ob.modifiers.new("rm", 'REMESH')
     r.mode = 'VOXEL'
     r.voxel_size = 0.25
@@ -494,7 +455,6 @@ def make_creature():
 
 
 def run_detection_cases(results):
-    # Case 1: creature with known joints, >100k verts.
     wipe_scene()
     entry = {"case": "detect_creature"}
     try:
@@ -528,7 +488,6 @@ def run_detection_cases(results):
     print("CASE_RESULT " + json.dumps(entry))
     sys.stdout.flush()
 
-    # Case 2: negative control - a sphere has no necks.
     wipe_scene()
     entry = {"case": "detect_sphere_negative"}
     try:
@@ -550,7 +509,6 @@ def run_detection_cases(results):
     print("CASE_RESULT " + json.dumps(entry))
     sys.stdout.flush()
 
-    # Case 3: a real STL (environment-dependent; set VIBECUT_REAL_STL).
     wipe_scene()
     entry = {"case": "detect_real_stl"}
     stl = os.environ.get("VIBECUT_REAL_STL", "")
@@ -589,11 +547,7 @@ def run_detection_cases(results):
     sys.stdout.flush()
 
 
-# ------------------------------------------------------------ quad convert
-
 def run_quad_convert_case(results):
-    """Densely triangulated box -> flat panels. Sharp 90-degree edges must
-    survive exactly; volume and bbox must not change."""
     wipe_scene()
     entry = {"case": "quad_convert"}
     try:
@@ -651,14 +605,12 @@ def run_quad_convert_case(results):
 
 
 def run_scale_guard_case(results):
-    """A bed-sized-x4 model must be refused FAST with scaling advice
-    instead of locking up."""
     wipe_scene()
     entry = {"case": "supports_bed_guard"}
     try:
         bm = bmesh.new()
         add_box(bm, 0, 0, 0, 900, 400, 400)
-        add_box(bm, 0, 0, 900, 950, 800, 600)   # giant overhang on top
+        add_box(bm, 0, 0, 900, 950, 800, 600)
         ob = obj_from_bm(bm, "giant")
         t0 = time.time()
         err = None
@@ -685,8 +637,6 @@ def run_scale_guard_case(results):
 
 
 def run_dense_proxy_case(results):
-    """A >250k-triangle model must auto-run analysis on a decimated proxy
-    and still pass validation in bounded time."""
     wipe_scene()
     entry = {"case": "supports_dense_proxy"}
     try:
@@ -728,9 +678,6 @@ def run_dense_proxy_case(results):
 
 
 def run_pins_case(results):
-    """The DEFAULT twist-off pin style: must be SPARSE and LIGHT compared
-    to the solid wizard (this is the whole point of restoring it).
-    Suzanne, both styles, compare vertex counts."""
     for style, label in (("PINS", "pins"), ("SOLID", "solid")):
         wipe_scene()
         entry = {"case": "supports_%s" % label}
@@ -762,13 +709,12 @@ def run_pins_case(results):
             {k: v for k, v in entry.items() if k != "_verts"}))
         sys.stdout.flush()
 
-    # Cross-check: pins must be dramatically lighter than solid.
     pins = next((r for r in results if r["case"] == "supports_pins"), None)
     solid = next((r for r in results if r["case"] == "supports_solid"), None)
     entry = {"case": "supports_pins_lighter"}
     if pins and solid and pins.get("_verts") and solid.get("_verts"):
         ratio = pins["_verts"] / max(solid["_verts"], 1)
-        ok = ratio < 0.5   # pins at most half the geometry of solid
+        ok = ratio < 0.5
         entry.update({
             "ok": ok,
             "failures": [] if ok else [
@@ -786,9 +732,6 @@ def run_pins_case(results):
 
 
 def run_color_shell_case(results):
-    """Color Piece: two cubes in one mesh, cube A starts on material slot 1.
-    Selecting one vert of A paints only A's shell; repainting keeps the
-    original slot; Cancel puts A back on slot 1 and leaves B alone."""
     entry = {"case": "color_shell"}
     fails = []
     try:
@@ -842,9 +785,6 @@ def run_color_shell_case(results):
 
 
 def run_heatmap_case(results):
-    """Overhang heatmap: a cube must read bottom face = 90 deg (needs
-    support), top/sides = 0; ~1/6 of area flagged. Attribute must be
-    written per-corner with valid colors."""
     wipe_scene()
     entry = {"case": "overhang_heatmap"}
     try:
@@ -855,7 +795,6 @@ def run_heatmap_case(results):
         stats = fsw.build_overhang_heatmap(ob, 45.0)
         attr = ob.data.color_attributes.get("VibeCut_Overhang")
         n_loops = len(ob.data.loops)
-        # read colors back
         cols = np.empty(n_loops * 4, dtype=np.float32)
         attr.data.foreach_get("color", cols)
         cols = cols.reshape(n_loops, 4)
@@ -864,7 +803,7 @@ def run_heatmap_case(results):
         pct = stats["pct_supported"]
         worst = stats["worst_deg"]
         ok = (attr is not None and attr.domain == 'CORNER'
-              and 12.0 < pct < 22.0      # bottom face ~1/6 = 16.7%
+              and 12.0 < pct < 22.0
               and 88.0 < worst <= 90.0
               and has_red and has_green)
         entry.update({
@@ -885,10 +824,6 @@ def run_heatmap_case(results):
 
 
 def run_inverted_normals_case(results):
-    """Inside-out model (all faces pointing in, as some STL exports are):
-    ceilings read as floors, so supports landed inside the model and as
-    crumbs. The pipeline must fix the faces and support it exactly like
-    the same model with correct faces."""
     wipe_scene()
     entry = {"case": "supports_inverted_normals"}
     try:
@@ -928,13 +863,11 @@ def run_inverted_normals_case(results):
 
 
 def make_wall_shelf():
-    """Shelf sticking out of a tall wall: posts under the shelf must not
-    run up alongside the wall (they would fuse to it)."""
     bm = bmesh.new()
-    add_box(bm, 2, 0, 0, 40, 4, 20)       # wall x 0..4
-    add_box(bm, 10, 0, 25, 28, 12, 20)    # shelf x 4..16
+    add_box(bm, 2, 0, 0, 40, 4, 20)
+    add_box(bm, 10, 0, 25, 28, 12, 20)
     ob = obj_from_bm(bm, "wall_shelf")
-    r = ob.modifiers.new("rm", 'REMESH')   # weld the boxes into one shell
+    r = ob.modifiers.new("rm", 'REMESH')
     r.mode = 'VOXEL'
     r.voxel_size = 0.5
     fsw._apply_modifiers_inplace(ob)
@@ -942,7 +875,6 @@ def make_wall_shelf():
 
 
 def make_socket_ball():
-    """Ball with sideways and downward cavities (eye-socket ball)."""
     def base(bm):
         bmesh.ops.create_uvsphere(bm, u_segments=48, v_segments=24,
                                   radius=20.0,
@@ -963,7 +895,6 @@ CLEAR_CASES = [
 
 
 def run_clear_cases(results):
-    """CLEAR style: supports touch the model ONLY at tip contacts."""
     for name, builder in CLEAR_CASES:
         wipe_scene()
         t0 = time.time()
@@ -1008,9 +939,6 @@ def _tool_sphere(name="tsphere", r=20.0, seg=48, rings=24):
 
 
 def _case_prep_messy():
-    """AI-style mess: every face split apart (duplicate verts), a floating
-    crumb, an open hole, inside-out faces. Prep must leave ONE watertight,
-    outward shell."""
     ob = _tool_sphere()
     bm = bmesh.new()
     bm.from_mesh(ob.data)
@@ -1096,10 +1024,10 @@ def _case_flat_bottom():
 
 def _case_thin_walls():
     bm = bmesh.new()
-    add_box(bm, 0, 0, 0, 0.6, 20, 20)          # 0.6 mm plate: too thin
+    add_box(bm, 0, 0, 0, 0.6, 20, 20)
     plate = obj_from_bm(bm, "plate")
     bm = bmesh.new()
-    add_box(bm, 40, 0, 0, 20, 20, 20)          # 20 mm cube: fine
+    add_box(bm, 40, 0, 0, 20, 20, 20)
     cube = obj_from_bm(bm, "cube")
     tp = tl.thin_wall_faces(plate, 1.2)
     tc = tl.thin_wall_faces(cube, 1.2)
@@ -1116,7 +1044,7 @@ def _case_symmetrize():
     bmesh.ops.create_cube(bm, size=10.0)
     for v in bm.verts:
         if v.co.x > 0 and v.co.y > 0 and v.co.z > 0:
-            v.co.x = 9.0                       # dent only the +X side
+            v.co.x = 9.0
     tl.symmetrize(bm, "X", 0.001)
     xs = sorted(round(v.co.x, 3) for v in bm.verts)
     bm.free()
@@ -1135,14 +1063,18 @@ def _case_even_remesh():
         fails.append("%d tris %d ngons" % (rep["tris"], rep["ngons"]))
     if not rep["watertight"]:
         fails.append("not watertight")
+    if "sharp_edge" in ob.data.attributes:
+        sharp = np.zeros(len(ob.data.edges), dtype=bool)
+        ob.data.attributes["sharp_edge"].data.foreach_get("value", sharp)
+        if sharp.any():
+            fails.append("%d edges marked sharp (Edit Mode draws them cyan)"
+                         % int(sharp.sum()))
     return fails, {"faces": rep["faces"]}
 
 
 def _case_scale_rotated():
-    """glTF imports arrive rotated 90 deg about X; 'height' must mean the
-    world Z side, not the mesh's local Z."""
     bm = bmesh.new()
-    add_box(bm, 0, 0, -1.5, 1.5, 1.0, 2.0)     # local 1 x 2 x 3
+    add_box(bm, 0, 0, -1.5, 1.5, 1.0, 2.0)
     ob = obj_from_bm(bm, "rot_box")
     ob.rotation_euler = (math.radians(90.0), 0.0, 0.0)
     bpy.context.view_layer.update()
@@ -1163,13 +1095,11 @@ def _case_straighten_wall():
     for i in range(cols):
         th = math.radians(120.0 * i / (cols - 1))
         frac = i / (cols - 1)
-        zb, zt = 2.0 + 3.0 * frac, 12.0 + 5.0 * frac    # sloped edges
+        zb, zt = 2.0 + 3.0 * frac, 12.0 + 5.0 * frac
         col = []
         for j in range(rows):
             z = zb + (zt - zb) * j / (rows - 1)
-            rr = R + rng.uniform(-0.6, 0.6)               # in/out wobble
-            # jagged top edge, but the 4 corner vertices are the
-            # reference: they stay true
+            rr = R + rng.uniform(-0.6, 0.6)
             corner = i in (0, cols - 1)
             zz = z + (0.0 if corner else
                       rng.uniform(-1.0, 1.0) if j == rows - 1 else
@@ -1210,7 +1140,6 @@ def _case_straighten_wall():
 
 
 def _case_straighten_thick_wall():
-    """Both faces of a 2 mm wall selected: must stay 2 mm apart."""
     import random as _r
     rng = _r.Random(11)
     bm = bmesh.new()
@@ -1228,7 +1157,7 @@ def _case_straighten_thick_wall():
                 bm.faces.new((grid[i][j], grid[i + 1][j], grid[i + 1][j + 1],
                               grid[i][j + 1]))
         sheets.append(grid)
-    for j in range(7):                 # end caps join the two sheets
+    for j in range(7):
         for i in (0, 80):
             bm.edges.new((sheets[0][i][j], sheets[1][i][j]))
     verts = [v for g in sheets for c in g for v in c]
@@ -1238,8 +1167,6 @@ def _case_straighten_thick_wall():
     inner_cols, end_cols = range(2, 79), (0, 1, 79, 80)
     ro, ri = radii(sheets[0], range(81)), radii(sheets[1], range(81))
     thick = sum(ro) / len(ro) - sum(ri) / len(ri)
-    # Interior must be clean; the two end columns of a noisy strip keep a
-    # small end-of-fit residual (known).
     mid = max(max(abs(r - 40.0) for r in radii(sheets[0], inner_cols)),
               max(abs(r - 38.0) for r in radii(sheets[1], inner_cols)))
     end = max(max(abs(r - 40.0) for r in radii(sheets[0], end_cols)),
@@ -1257,9 +1184,6 @@ def _case_straighten_thick_wall():
 
 
 def _two_strips():
-    """Lower wall strip (rim: 32 verts at z=0) + upper strip (rim: 20 verts,
-    slightly bigger, at z=0.3) - separate pieces with a gap, both rims
-    selected."""
     bm = bmesh.new()
 
     def ring(n, r, z, ph=0.0):
@@ -1294,12 +1218,10 @@ def _seam_report(bm):
 
 def _case_snap_loop():
     fails = []
-    # Original script behaviour (no zip): leaves T-junctions.
     bm = _two_strips()
     r0 = tl.snap_loop_to_loop(bm, Matrix.Identity(4), 'HIGHER', True, False)
     o0, _, _, _ = _seam_report(bm)
     bm.free()
-    # Tool default (zip on): one watertight seam.
     bm = _two_strips()
     r = tl.snap_loop_to_loop(bm, Matrix.Identity(4), 'HIGHER', True, True)
     o1, bnd, nonman, zoff = _seam_report(bm)
@@ -1308,7 +1230,7 @@ def _case_snap_loop():
         fails.append("%d verts missed" % r["missed"])
     if o1:
         fails.append("%d open seam edges with zip" % o1)
-    if bnd != 52:                 # only the far rims stay open: 32 + 20
+    if bnd != 52:
         fails.append("boundary edges %d (want 52)" % bnd)
     if nonman:
         fails.append("%d non-manifold edges" % nonman)
@@ -1334,8 +1256,121 @@ TOOL_CASES = [
 ]
 
 
+def _degenerate_faces(bm):
+    return [f for f in bm.faces
+            if len({v.index for v in f.verts}) < 3 or f.calc_area() < 1e-12]
+
+
+def _case_cc_nearest():
+    fails = []
+    for mat3, want in ((None, (0.5, 0.0)), (Matrix.Diagonal((10, 1, 1)),
+                                            (0.0, 0.8))):
+        bm = bmesh.new()
+        g = {}
+        for x in (-1, 0, 1):
+            for y in (-1, 0, 1):
+                g[x, y] = bm.verts.new((x, y, 0))
+        g[1, 0].co.x = 0.5
+        g[0, 1].co.y = 0.8
+        for x in (-1, 0):
+            for y in (-1, 0):
+                bm.faces.new((g[x, y], g[x + 1, y], g[x + 1, y + 1],
+                              g[x, y + 1]))
+        kept = cc.collapse_vertex(bm, g[0, 0], mat3)
+        bm.verts.index_update()
+        tag = "local" if mat3 is None else "scaled"
+        if kept is None or tuple(round(c, 6) for c in kept.co[:2]) != want:
+            fails.append("%s: kept %s, want %s"
+                         % (tag, kept and kept.co[:2], want))
+        if len(bm.verts) != 8 or len(bm.faces) != 4:
+            fails.append("%s: %d verts %d faces (want 8 / 4)"
+                         % (tag, len(bm.verts), len(bm.faces)))
+        if _degenerate_faces(bm):
+            fails.append("%s: degenerate faces left" % tag)
+        bm.free()
+    return fails, {}
+
+
+def _case_cc_fan():
+    bm = bmesh.new()
+    n = 16
+    c = bm.verts.new((0, 0, 0))
+    rim = [bm.verts.new((5 * math.cos(2 * math.pi * i / n),
+                         5 * math.sin(2 * math.pi * i / n), 0))
+           for i in range(n)]
+    for i in range(n):
+        bm.faces.new((c, rim[i], rim[(i + 1) % n]))
+    keep_co = [tuple(v.co) for v in rim[1:]] + [tuple(c.co)]
+    kept = cc.collapse_vertex(bm, rim[0])
+    fails = []
+    if kept is None or kept not in (rim[1], rim[-1]):
+        fails.append("did not merge into a rim neighbour")
+    if len(bm.verts) != n or len(bm.faces) != n - 1:
+        fails.append("%d verts %d faces (want %d / %d)"
+                     % (len(bm.verts), len(bm.faces), n, n - 1))
+    if sorted(tuple(v.co) for v in bm.verts) != sorted(keep_co):
+        fails.append("surviving verts moved")
+    bm.verts.index_update()
+    if _degenerate_faces(bm):
+        fails.append("degenerate faces left")
+    bm.free()
+    return fails, {}
+
+
+def _case_cc_pick():
+    from mathutils.bvhtree import BVHTree
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=2.0)
+    bm.verts.ensure_lookup_table()
+    co = np.array([v.co[:] for v in bm.verts])
+    usable = np.ones(len(co), bool)
+    bvh = BVHTree.FromBMesh(bm)
+    cam_data = bpy.data.cameras.new("cc_cam")
+    cam = bpy.data.objects.new("cc_cam", cam_data)
+    bpy.context.scene.collection.objects.link(cam)
+    cam.location = (0.0, -10.0, 0.0)
+    cam.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+    bpy.context.view_layer.update()
+    W, H = 800, 600
+    persp = cam.calc_matrix_camera(bpy.context.evaluated_depsgraph_get(),
+                                   x=W, y=H) @ cam.matrix_world.inverted()
+    px, front = cc.project_verts(co, persp, W, H)
+    vis_p = cc.make_visibility_test(bvh, co, eye=Vector((0, -10, 0)))
+    vis_o = cc.make_visibility_test(bvh, co, view_dir=Vector((0, 1, 0)),
+                                    far=20.0)
+    fails = []
+    near = [i for i in range(len(co)) if co[i][1] < 0]
+    far_ = [i for i in range(len(co)) if co[i][1] > 0]
+    for i in near:
+        got = cc.pick_vertex(px, front, usable, px[i], 5.0, vis_p)
+        if got != i:
+            fails.append("front vert %d: picked %d" % (i, got))
+    for i in far_:
+        if cc.pick_vertex(px, front, usable, px[i], 5.0, vis_p) != -1:
+            fails.append("hidden back vert %d was picked" % i)
+        if cc.pick_vertex(px, front, usable, px[i], 5.0) != i:
+            fails.append("x-ray: back vert %d not picked" % i)
+        if vis_o(i):
+            fails.append("ortho: back vert %d counted visible" % i)
+    if not all(vis_o(i) for i in near):
+        fails.append("ortho: a front vert counted hidden")
+    hidden = usable.copy()
+    hidden[near[0]] = False
+    if cc.pick_vertex(px, front, hidden, px[near[0]], 5.0, vis_p) == near[0]:
+        fails.append("picked a hidden (H) vert")
+    bm.free()
+    return fails, {}
+
+
+CLICK_COLLAPSE_CASES = [
+    ("cc_nearest", _case_cc_nearest),
+    ("cc_fan", _case_cc_fan),
+    ("cc_pick", _case_cc_pick),
+]
+
+
 def run_tool_cases(results):
-    for name, fn in TOOL_CASES:
+    for name, fn in TOOL_CASES + CLICK_COLLAPSE_CASES:
         wipe_scene()
         entry = {"case": name}
         try:
@@ -1351,20 +1386,17 @@ def run_tool_cases(results):
 
 
 def run_big_organic_case(results):
-    """Printable-size BIG organic model (scaled up to print size): many
-    overhang islands, tall tree descents. Must complete in bounded time -
-    large tree forests must not lock Blender up."""
     wipe_scene()
     entry = {"case": "supports_big_organic"}
     try:
         bm = bmesh.new()
-        _add_capsule(bm, (-50, 0, 130), (50, 0, 130), 45.0)   # fat body
-        _add_capsule(bm, (60, 0, 150), (95, 0, 185), 16.0)    # neck/head
+        _add_capsule(bm, (-50, 0, 130), (50, 0, 130), 45.0)
+        _add_capsule(bm, (60, 0, 150), (95, 0, 185), 16.0)
         for sx in (-1, 1):
             for sy in (-1, 1):
                 _add_capsule(bm, (45 * sx, 28 * sy, 110),
-                             (60 * sx, 38 * sy, 40), 12.0)    # legs (air)
-        _add_capsule(bm, (-60, 0, 140), (-100, 0, 95), 10.0)  # tail
+                             (60 * sx, 38 * sy, 40), 12.0)
+        _add_capsule(bm, (-60, 0, 140), (-100, 0, 95), 10.0)
         me = bpy.data.meshes.new("bigblob")
         bm.to_mesh(me)
         bm.free()
@@ -1401,8 +1433,6 @@ def run_big_organic_case(results):
     sys.stdout.flush()
 
 
-# ---------------------------------------------------------------- hinge
-
 def _solid_box(name, x0, x1, y0, y1, z0, z1):
     bm = bmesh.new()
     add_box(bm, (x0 + x1) / 2, (y0 + y1) / 2, z0, z1, x1 - x0, y1 - y0)
@@ -1410,9 +1440,6 @@ def _solid_box(name, x0, x1, y0, y1, z0, z1):
 
 
 def make_fused_box(barrel_off=(0.0, 0.0), barrel_r=3.0):
-    """2D->3D style box: open-top tray, lid propped open 60 deg, and a fake
-    hinge barrel welding the two into ONE watertight shell. barrel_off puts
-    the fake barrel off the lid's TRUE pivot (x, z), like AI models do."""
     tray = _solid_box("hinge_box", -30, 30, -20, 20, 0, 20)
     hole = bpy.data.meshes.new("h")
     bm = bmesh.new()
@@ -1444,7 +1471,6 @@ def run_hinge_cases(results):
             ob, axis_c = make_fused_box()
             pieces_before = int(hg._components(ob.data).max()) + 1
             t0 = time.time()
-            # Same flow as the panel: rough guide (0.5 mm off), Snap, Build.
             fit = hg.fit_fake_hinge(ob, axis_c + Vector((0.4, 0, -0.3)),
                                     Vector((0, 1, 0)), 12.0, 3.2)
             fails = []
@@ -1477,9 +1503,6 @@ def run_hinge_cases(results):
         print("CASE_RESULT " + json.dumps(entry, default=str))
         sys.stdout.flush()
 
-    # Regression: fake barrel 3.2 mm off the lid's true
-    # pivot. A hinge can validate OK while the lid cannot shut. Build
-    # must find the real pivot and the lid must swing fully closed.
     entry = {"case": "hinge_offset_fake_barrel"}
     try:
         wipe_scene()
@@ -1493,10 +1516,6 @@ def run_hinge_cases(results):
         fails = []
         f = res.get("fit") or {}
         err = (Vector(f["center"]) - axis_c).length if f else 99
-        # A flat lid on a flat-topped tray seats equally well slid ~2.5 mm
-        # toward the hinge (verified: identical rim scores), so the pivot
-        # only has to move off the fake barrel toward the truth; what MUST
-        # hold is that the lid swings fully shut and seats.
         if not f or f["moved_mm"] < 1.0:
             fails.append("fit did not move the axis off the fake barrel")
         if err > 3.0:

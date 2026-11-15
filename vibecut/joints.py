@@ -1,38 +1,9 @@
-"""
-joint_library.py -- Blend-file joint library: discover, import, scale, orient, boolean.
-
-Two-phase workflow
-------------------
-1. place_joint()         -- import + orient joint objects, leave in scene for user
-                            to freely move/rotate before committing
-2. apply_joint_boolean() -- bake current position and run UNION booleans
-
-insert_joint() is a one-shot convenience that combines both steps (no
-repositioning step) -- used by scripts and tests.
-
-File naming conventions (two schemes):
-
-  Scheme A -- Paired files (RECOMMENDED):
-    Joints/<setname>_ball.blend     -- single object (the ball piece)
-    Joints/<setname>_socket.blend   -- single object (the socket cup)
-
-  Scheme B -- Combined file (legacy):
-    Joints/<name>.blend  -- contains BOTH joint_ball AND joint_socket objects
-
-Object conventions:
-  - ORIGIN at attachment face centre (the flat face that welds to the cut)
-  - +Z axis points away from attachment face toward the mating part
-  - Optional custom property joint_radius (float) on the ball object
-    = sphere radius at scale 1.0; auto-detected from vertex extents if absent
-"""
-
 import bpy
 import os
 from mathutils import Vector
 
 JOINTS_DIR = os.path.join(os.path.dirname(__file__), "Joints")
 
-# Stable tag names used for placed preview objects
 _BALL_TAG   = "rc_joint_ball_preview"
 _SOCKET_TAG = "rc_joint_socket_preview"
 _PIN_TAG    = "rc_press_pin_preview"
@@ -41,15 +12,7 @@ _SCREW_M_TAG = "rc_screw_male_preview"
 _SCREW_F_TAG = "rc_screw_female_preview"
 
 
-# ---------------------------------------------------------------------------
-# Blend file discovery
-# ---------------------------------------------------------------------------
-
 def _find_joint_sets():
-    """
-    Scan Joints/ and return (set_id, label, description) tuples for EnumProperty.
-    Scheme A pairs take priority; lone files are listed as Scheme B.
-    """
     if not os.path.isdir(JOINTS_DIR):
         return [("none", "Joints/ folder not found", "")]
 
@@ -81,16 +44,7 @@ def joint_enum_items(self, context):
     return _find_joint_sets()
 
 
-# ---------------------------------------------------------------------------
-# Object import helper
-# ---------------------------------------------------------------------------
-
 def _import_object(blend_path, preferred_name, collection):
-    """
-    Append an object from blend_path into collection.
-    Tries preferred_name first; falls back to the first object in the file.
-    Returns the bpy.types.Object or None.
-    """
     if not os.path.isfile(blend_path):
         print(f"[VibeCut] Blend not found: {blend_path}")
         return None
@@ -116,22 +70,11 @@ def _import_object(blend_path, preferred_name, collection):
     return None
 
 
-# ---------------------------------------------------------------------------
-# Reference radius detection
-# ---------------------------------------------------------------------------
-
 def _get_ref_radius(obj):
-    """
-    Maximum XY radius of the object measured in WORLD space.
-    Call BEFORE transform_apply so the blend-file location offset is still live.
-    Forces a depsgraph update so matrix_world reflects the actual location.
-    Falls back to joint_radius IDProperty when present.
-    """
     if "joint_radius" in obj.keys():
         return float(obj["joint_radius"])
 
     import bmesh
-    # Force scene graph evaluation so matrix_world includes the location offset
     bpy.context.view_layer.update()
     mw  = obj.matrix_world
     bm  = bmesh.new()
@@ -146,12 +89,6 @@ def _get_ref_radius(obj):
 
 
 def _get_stem_offset(obj):
-    """
-    Distance from the attachment face (world-space minimum Z) to the object
-    world origin, measured PRE-normalize.
-    Forces depsgraph update before reading matrix_world.
-    A positive return value = origin is that many units ABOVE the attachment face.
-    """
     import bmesh
     bpy.context.view_layer.update()
     mw = obj.matrix_world
@@ -162,18 +99,12 @@ def _get_stem_offset(obj):
         return 0.0
     world_zs = [(mw @ v.co).z for v in bm.verts]
     bm.free()
-    offset = -min(world_zs)   # how far origin is above attachment face
+    offset = -min(world_zs)
     print(f"[VibeCut] _get_stem_offset({obj.name}): min_world_z={min(world_zs):.4f}  offset={offset:.4f}")
     return offset
 
 
 def _center_mesh_xy(obj):
-    """
-    Translate the mesh vertex coordinates so the XY bounding-box centre lands
-    exactly at the local origin.  Call AFTER transform_apply to fix any
-    authoring offsets that were baked in (e.g. ball Y-offset of 0.628).
-    Also recentres Z so the minimum Z vertex (attachment face) is at Z=0.
-    """
     import bmesh
     bm = bmesh.new()
     bm.from_mesh(obj.data)
@@ -185,7 +116,7 @@ def _center_mesh_xy(obj):
     zs = [v.co.z for v in bm.verts]
     cx = (min(xs) + max(xs)) / 2.0
     cy = (min(ys) + max(ys)) / 2.0
-    cz = min(zs)                        # attachment face always at local Z = 0
+    cz = min(zs)
     for v in bm.verts:
         v.co.x -= cx
         v.co.y -= cy
@@ -196,22 +127,8 @@ def _center_mesh_xy(obj):
     print(f"[VibeCut] _center_mesh_xy({obj.name}): shifted XY=({cx:.4f},{cy:.4f})  Z={cz:.4f}")
 
 
-# ---------------------------------------------------------------------------
-# Shared prepare helper
-# ---------------------------------------------------------------------------
-
 def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
                         ball_name="joint_ball", socket_name="joint_socket"):
-    """
-    Import, measure, normalize, scale, and orient both joint objects at the
-    cut plane.  Returns (ball_obj, socket_obj) or (None, None).
-
-    Measurements (ref_r, stem_offset) are taken PRE-normalize while the
-    object location is still in matrix_world.  Normalize is applied after
-    measuring so vertex coordinates are baked for the boolean solver.
-
-    The attachment face of each piece is placed exactly at plane_co_w.
-    """
     from .geometry import _orient_matrix
     from mathutils import Matrix
 
@@ -235,14 +152,9 @@ def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
                 bpy.data.objects.remove(o, do_unlink=True)
         return None, None
 
-    # Measure ref_r PRE-normalize using world-space vertices.
-    # After transform_apply the location offset is baked into vertex coords,
-    # skewing the XY extent calculation.  Measure first, normalize second.
-    # Scale is derived from the SOCKET so its outer rim fits the cut opening.
-    # The same scale factor is then applied to the ball, keeping both matched.
     ref_r         = _get_ref_radius(socket)
     ball_ref_r    = _get_ref_radius(ball)
-    ball_stem_off = _get_stem_offset(ball)    # origin → attachment face distance
+    ball_stem_off = _get_stem_offset(ball)
     sock_stem_off = _get_stem_offset(socket)
 
     print(f"[VibeCut] PRE-normalize: socket_ref_r={ref_r:.4f}  ball_ref_r={ball_ref_r:.4f}  "
@@ -254,7 +166,6 @@ def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
             bpy.data.objects.remove(o, do_unlink=True)
         return None, None
 
-    # Normalize: bake blend-file location/rotation/scale into vertex coordinates.
     bpy.ops.object.select_all(action='DESELECT')
     for jobj in (ball, socket):
         jobj.select_set(True)
@@ -262,15 +173,12 @@ def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         jobj.select_set(False)
 
-    # Recenter: fix any XY baking offset so both pieces share the same axis.
-    # Also pins attachment face to local Z=0 so stem_offset math stays exact.
     for jobj in (ball, socket):
         _center_mesh_xy(jobj)
     scale = target_radius / ref_r
     co    = Vector(plane_co_w)
     no    = Vector(plane_no_w).normalized()
 
-    # Measure scaled heights of each joint piece
     import bmesh as _bm
     _b = _bm.new(); _b.from_mesh(ball.data)
     ball_h   = (max(v.co.z for v in _b.verts) - min(v.co.z for v in _b.verts)) * scale
@@ -279,17 +187,12 @@ def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
     socket_h = (max(v.co.z for v in _s.verts) - min(v.co.z for v in _s.verts)) * scale
     _s.free()
 
-    # --- Adaptive embed depth ---
-    # Target 5 mm, but cap at 30 % of the shorter joint piece so the joint
-    # is never buried completely inside the mesh (would happen for small rings).
     unit_scale   = bpy.context.scene.unit_settings.scale_length
-    embed_target = 0.005 / unit_scale          # 5 mm in scene units
+    embed_target = 0.005 / unit_scale
     embed_depth  = min(embed_target, min(ball_h, socket_h) * 0.30)
 
-    # Separation gap = the visible (non-embedded) protrusion of each piece,
-    # so the gap is exactly wide enough to fit both joints end-to-end.
     sep_dist = (ball_h - embed_depth) + (socket_h - embed_depth)
-    sep_dist = max(sep_dist, 0.0005 / unit_scale)   # floor at ~0.5 mm
+    sep_dist = max(sep_dist, 0.0005 / unit_scale)
 
     limb_obj = bpy.data.objects.get(bpy.context.scene.get("rc_limb", ""))
     if limb_obj:
@@ -299,8 +202,6 @@ def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
 
     print(f"[VibeCut] embed_depth={embed_depth:.4f}  sep_dist={sep_dist:.4f}")
 
-    # Socket → body side: attachment face embed_depth inside body, cup faces gap
-    # Ball   → limb side: attachment face embed_depth inside limb, ball faces gap
     socket_co = co + no * embed_depth
     ball_co   = co - no * (sep_dist + embed_depth)
 
@@ -309,7 +210,6 @@ def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
 
     scale_mat = Matrix.Scale(scale, 4)
 
-    # Compose orient + scale into matrix_world in one shot.
     ball.matrix_world   = _orient_matrix(ball_co,    no)  @ scale_mat
     socket.matrix_world = _orient_matrix(socket_co, -no)  @ scale_mat
 
@@ -318,22 +218,12 @@ def _prepare_and_orient(ctx, set_id, plane_co_w, plane_no_w, target_radius,
     return ball, socket
 
 
-# ---------------------------------------------------------------------------
-# Press-fit helpers
-# ---------------------------------------------------------------------------
-
 def _make_cylinder_obj(name, radius, height, collection, segments=48):
-    """
-    Build a capped cylinder mesh object with its flat base at local Z=0
-    and its tip at local Z=height.  The boolean solver needs a clean,
-    closed mesh — cap_ends=True gives us that.
-    """
     import bmesh as _bm
     bm = _bm.new()
     _bm.ops.create_cone(
         bm, cap_ends=True, cap_tris=False,
         segments=segments, radius1=radius, radius2=radius, depth=height)
-    # create_cone centres the cylinder at origin; shift +Z so base sits at Z=0
     dz = height / 2.0
     for v in bm.verts:
         v.co.z += dz
@@ -347,15 +237,6 @@ def _make_cylinder_obj(name, radius, height, collection, segments=48):
 
 
 def place_press_fit(ctx, plane_co_w, plane_no_w, target_radius):
-    """
-    Procedural compression-fit joint.
-
-    Pin  (UNION      → limb):  cylinder that protrudes from limb toward body.
-    Hole (DIFFERENCE → body):  slightly wider/deeper cylinder cut into body.
-
-    target_radius is already scaled by rc_pin_pct in the caller.
-    Returns (pin_obj, hole_obj) or (None, None).
-    """
     from .geometry import _orient_matrix
     from mathutils import Vector
 
@@ -363,15 +244,13 @@ def place_press_fit(ctx, plane_co_w, plane_no_w, target_radius):
     unit_scale = scene.unit_settings.scale_length
 
     pin_r       = target_radius
-    pin_depth   = scene.rc_pin_depth    / unit_scale   # total pin protrusion
+    pin_depth   = scene.rc_pin_depth    / unit_scale
     tolerance   = scene.rc_pin_tolerance / unit_scale
     hole_r      = pin_r + tolerance
-    # Hole is 1 mm deeper than pin so it never bottoms out during assembly
     hole_depth  = pin_depth + (0.001 / unit_scale)
 
     col = scene.collection
 
-    # Remove any previous press-fit or library previews
     for tag in (_PIN_TAG, _HOLE_TAG, _BALL_TAG, _SOCKET_TAG):
         old = bpy.data.objects.get(tag)
         if old:
@@ -383,13 +262,10 @@ def place_press_fit(ctx, plane_co_w, plane_no_w, target_radius):
     co = Vector(plane_co_w)
     no = Vector(plane_no_w).normalized()
 
-    # Embed the pin base 25 % of its depth into the limb for structural grip.
-    # This means the pin protrudes (pin_depth * 0.75) beyond the cut face.
     embed      = pin_depth * 0.25
-    pin_height = pin_depth + embed           # total cylinder height
-    pin_co     = co - no * embed             # base is embed units behind cut plane
+    pin_height = pin_depth + embed
+    pin_co     = co - no * embed
 
-    # Hole opening is flush with the body cut face; cutter goes into body
     hole_co = co
 
     pin_obj  = _make_cylinder_obj(_PIN_TAG,  pin_r,  pin_height, col)
@@ -400,17 +276,12 @@ def place_press_fit(ctx, plane_co_w, plane_no_w, target_radius):
                 bpy.data.objects.remove(o, do_unlink=True)
         return None, None
 
-    # _orient_matrix: local +Z → world `no` direction.
-    # Pin base at pin_co, protrudes along +no (toward body).
-    # Hole base at hole_co, cutter goes along +no (into body).
     pin_obj.matrix_world  = _orient_matrix(pin_co,  no)
     hole_obj.matrix_world = _orient_matrix(hole_co, no)
 
     pin_obj.name  = _PIN_TAG
     hole_obj.name = _HOLE_TAG
 
-    # Re-use the same scene keys as the library workflow so Apply/Cancel
-    # operators need no changes.
     scene["rc_joint_ball"]   = pin_obj.name
     scene["rc_joint_socket"] = hole_obj.name
 
@@ -425,11 +296,6 @@ def place_press_fit(ctx, plane_co_w, plane_no_w, target_radius):
 
 
 def apply_press_fit_boolean(ctx):
-    """
-    Bake transforms then run:
-      pin  UNION      → limb   (pin becomes part of limb)
-      hole DIFFERENCE → body   (hole cut into body)
-    """
     from .geometry import _apply_boolean
 
     scene    = ctx.scene
@@ -460,21 +326,8 @@ def apply_press_fit_boolean(ctx):
     return True
 
 
-# ---------------------------------------------------------------------------
-# Phase 1: Place
-# ---------------------------------------------------------------------------
-
 def place_joint(ctx, set_id, plane_co_w, plane_no_w, target_radius,
                 ball_name="joint_ball", socket_name="joint_socket"):
-    """
-    Import, orient, and leave the joint objects in the scene as normal mesh
-    objects that the user can freely reposition (G/R/S) before applying.
-
-    Old preview objects are removed on each call.
-    Object names are stored in scene custom props for apply_joint_boolean().
-    Returns (ball_obj, socket_obj) or (None, None).
-    """
-    # Clean up any previous unapplied preview
     for tag in (_BALL_TAG, _SOCKET_TAG):
         old = bpy.data.objects.get(tag)
         if old:
@@ -489,38 +342,21 @@ def place_joint(ctx, set_id, plane_co_w, plane_no_w, target_radius,
     if ball is None:
         return None, None
 
-    # Tag with stable names so Apply can always find them
     ball.name   = _BALL_TAG
     socket.name = _SOCKET_TAG
 
-    # Select both so user can grab + move immediately
     bpy.ops.object.select_all(action='DESELECT')
     ball.select_set(True)
     socket.select_set(True)
     ctx.view_layer.objects.active = ball
 
-    # Store names for the Apply operator
     ctx.scene["rc_joint_ball"]   = ball.name
     ctx.scene["rc_joint_socket"] = socket.name
 
     return ball, socket
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: Apply
-# ---------------------------------------------------------------------------
-
 def apply_joint_boolean(ctx):
-    """
-    Bake the current position/rotation of the preview joint objects, then run
-    UNION booleans onto body and limb.  Reads all names from scene custom props.
-
-    Boolean directions:
-    ball  UNION --> limb_obj  (ball protrusion becomes part of limb)
-    socket UNION --> body_obj (socket cup becomes part of body)
-    Cutter objects are removed by _apply_boolean after the modifier is applied.
-    Returns True on success.
-    """
     from .geometry import _apply_boolean
 
     scene      = ctx.scene
@@ -547,7 +383,6 @@ def apply_joint_boolean(ctx):
         print("[VibeCut] apply_joint_boolean: preview objects not found")
         return False
 
-    # Bake any user repositioning before the Exact boolean solver runs
     bpy.ops.object.select_all(action='DESELECT')
     for jobj in (ball_obj, socket_obj):
         jobj.select_set(True)
@@ -555,8 +390,6 @@ def apply_joint_boolean(ctx):
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         jobj.select_set(False)
 
-    # ball → limb (ball protrudes toward body, attachment face embedded in limb)
-    # socket → body (socket cup opens toward limb, attachment face embedded in body)
     print(f"[VibeCut] boolean: ball UNION into {limb_name!r}")
     _apply_boolean(limb_obj, ball_obj,   'UNION', ctx)
     print(f"[VibeCut] boolean: socket UNION into {body_name!r}")
@@ -566,7 +399,6 @@ def apply_joint_boolean(ctx):
           f"limb verts={len(limb_obj.data.vertices)}  "
           f"body verts={len(body_obj.data.vertices)}")
 
-    # Clear placement props (cutter objects removed by _apply_boolean)
     for key in ("rc_joint_ball", "rc_joint_socket"):
         if key in scene:
             del scene[key]
@@ -574,12 +406,7 @@ def apply_joint_boolean(ctx):
     return True
 
 
-# ---------------------------------------------------------------------------
-# Cancel placement
-# ---------------------------------------------------------------------------
-
 def cancel_joint_placement(ctx):
-    """Remove preview joint objects without applying booleans."""
     scene = ctx.scene
     for key in ("rc_joint_ball", "rc_joint_socket"):
         name = scene.get(key, "")
@@ -590,13 +417,8 @@ def cancel_joint_placement(ctx):
             del scene[key]
 
 
-# ---------------------------------------------------------------------------
-# One-shot insert (no repositioning step -- scripting / tests)
-# ---------------------------------------------------------------------------
-
 def insert_joint(ctx, set_id, body_obj, limb_obj, plane_co_w, plane_no_w,
                  target_radius, ball_name="joint_ball", socket_name="joint_socket"):
-    """Place + immediately apply boolean (skips user repositioning)."""
     from .geometry import _apply_boolean, _is_valid
     if not _is_valid(body_obj) or not _is_valid(limb_obj):
         print("[VibeCut] insert_joint: body or limb invalid")
@@ -620,33 +442,7 @@ def insert_joint(ctx, set_id, body_obj, limb_obj, plane_co_w, plane_no_w,
     return True
 
 
-# ---------------------------------------------------------------------------
-# Screw-top joint (threaded male shaft + female cavity)
-# ---------------------------------------------------------------------------
-#
-# Geometry: male = solid inner cylinder + helical thread ridge with triangular
-# cross-section. Female = same shape inflated by `tolerance` radially, used as
-# a DIFFERENCE cutter against the body so the body gets matching internal threads.
-#
-# Workflow mirrors press-fit:
-#   place_screw_top()        -> builds male + female previews at the cut plane
-#   apply_screw_top_boolean() -> male UNION -> limb (lid), female DIFFERENCE -> body
-#
-# Build order: lid screws DOWN onto body. Male shaft points DOWN from lid bottom.
-# Female cavity opens UP into the body. So in cut-plane local coords:
-#   - Limb (top piece): male shaft is built going AWAY from cut plane along -no
-#   - Body (bottom piece): female cavity is carved INTO body along +no (from the
-#     limb side, into the body)
-# But after Ring Cutter, limb_obj sits ABOVE the cut and is moved +no during
-# joint placement. So both pieces sit on either side of the cut plane normal.
-
 def _build_thread_mesh(bm, base_r, thread_depth, pitch, n_turns, segments_per_turn=32):
-    """Add to bm: an inner solid cylinder + outer helical thread ridge.
-
-    Both volumes are MANIFOLD and slightly overlap radially (root recessed 0.5%
-    into the cylinder) so a downstream UNION boolean fuses them into one solid.
-    Cylinder base sits at local Z=0; height = n_turns * pitch.
-    """
     import bmesh as _bm
     import math
 
@@ -655,17 +451,14 @@ def _build_thread_mesh(bm, base_r, thread_depth, pitch, n_turns, segments_per_tu
     dtheta = 2.0 * math.pi / segments_per_turn
     dz_step = pitch / segments_per_turn
 
-    # 1) Inner solid cylinder, base at Z=0, top at Z=height
     res = _bm.ops.create_cone(bm, cap_ends=True, cap_tris=False,
                               segments=segments_per_turn,
                               radius1=base_r, radius2=base_r, depth=height)
     new_verts = res.get("verts", []) if isinstance(res, dict) else []
-    # create_cone centers at origin -> lift so base is at z=0
     for v in new_verts:
         v.co.z += height / 2.0
 
-    # 2) Helical thread ridge: triangular cross-section sweeping around
-    r_root = base_r * 0.995    # recess slightly so volumes overlap
+    r_root = base_r * 0.995
     r_crest = base_r + thread_depth
 
     rings = []
@@ -673,14 +466,11 @@ def _build_thread_mesh(bm, base_r, thread_depth, pitch, n_turns, segments_per_tu
         theta = i * dtheta
         z_base = i * dz_step
         cos_t = math.cos(theta); sin_t = math.sin(theta)
-        # Triangle spans EXACTLY one pitch so consecutive turns share their
-        # boundary verts after remove_doubles
         v_lo = bm.verts.new((r_root  * cos_t, r_root  * sin_t, z_base))
         v_cr = bm.verts.new((r_crest * cos_t, r_crest * sin_t, z_base + 0.5 * pitch))
         v_hi = bm.verts.new((r_root  * cos_t, r_root  * sin_t, z_base + pitch))
         rings.append((v_lo, v_cr, v_hi))
 
-    # Quad strips around triangular cross-section between consecutive rings
     for i in range(total_steps):
         lo_a, cr_a, hi_a = rings[i]
         lo_b, cr_b, hi_b = rings[i + 1]
@@ -692,7 +482,6 @@ def _build_thread_mesh(bm, base_r, thread_depth, pitch, n_turns, segments_per_tu
             except ValueError:
                 pass
 
-    # End-cap the ridge with triangular faces (open ends would be non-manifold)
     try: bm.faces.new(list(rings[0]))
     except ValueError: pass
     try: bm.faces.new(list(reversed(rings[-1])))
@@ -701,10 +490,6 @@ def _build_thread_mesh(bm, base_r, thread_depth, pitch, n_turns, segments_per_tu
 
 def _make_thread_obj(name, base_r, thread_depth, pitch, n_turns, collection,
                     segments_per_turn=32, do_union=True):
-    """Build a screw-top thread object (manifold solid). Optionally collapses
-    the inner cylinder + thread ridge into a single welded volume via a
-    self-UNION boolean. Returns the bpy.types.Object.
-    """
     import bmesh as _bm
 
     bm = _bm.new()
@@ -715,7 +500,6 @@ def _make_thread_obj(name, base_r, thread_depth, pitch, n_turns, collection,
     obj = bpy.data.objects.new(name, mesh)
     collection.objects.link(obj)
 
-    # Cleanup pass
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.select_all(action='DESELECT')
     obj.select_set(True)
@@ -726,9 +510,6 @@ def _make_thread_obj(name, base_r, thread_depth, pitch, n_turns, collection,
     bpy.ops.object.mode_set(mode='OBJECT')
 
     if do_union:
-        # Self-union: use a self-boolean to merge cylinder + ridge into one volume.
-        # The MANIFOLD solver in 4.5+ requires two separate inputs, so we duplicate
-        # and use the dup as the cutter (operation=UNION) — produces one welded mesh.
         dup_mesh = obj.data.copy()
         dup_obj = bpy.data.objects.new(name + "_dup", dup_mesh)
         collection.objects.link(dup_obj)
@@ -760,20 +541,11 @@ def _make_thread_obj(name, base_r, thread_depth, pitch, n_turns, collection,
 
 
 def place_screw_top(ctx, plane_co_w, plane_no_w, target_radius):
-    """Procedural threaded screw-top joint.
-
-    Male  (UNION      -> limb / lid):   threaded shaft protruding from limb toward body
-    Female (DIFFERENCE -> body):        slightly wider threaded shaft used as cutter
-
-    target_radius: external male thread base radius (caller usually scales by rc_screw_pct)
-    Returns (male_obj, female_obj) or (None, None).
-    """
     from .geometry import _orient_matrix
     from mathutils import Vector
 
     scene = ctx.scene
     unit_scale = scene.unit_settings.scale_length
-    # Properties are stored in scene units (NOT mm) for consistency with other tools
     pitch       = scene.rc_screw_pitch    / unit_scale
     depth       = scene.rc_screw_depth    / unit_scale
     n_turns     = max(1, int(scene.rc_screw_turns))
@@ -786,7 +558,6 @@ def place_screw_top(ctx, plane_co_w, plane_no_w, target_radius):
 
     col = scene.collection
 
-    # Clear previous previews (any flavor)
     for tag in (_PIN_TAG, _HOLE_TAG, _BALL_TAG, _SOCKET_TAG, _SCREW_M_TAG, _SCREW_F_TAG):
         old = bpy.data.objects.get(tag)
         if old:
@@ -798,19 +569,8 @@ def place_screw_top(ctx, plane_co_w, plane_no_w, target_radius):
     co = Vector(plane_co_w)
     no = Vector(plane_no_w).normalized()
 
-    # Convention:
-    #   `body` lives on the +no side of the cut plane -> becomes the LID (gets male)
-    #   `limb` lives on the -no side of the cut plane -> becomes the CONTAINER (gets female)
-    # Male shaft straddles the cut plane:
-    #   embed_pct fraction sits INSIDE body (above cut) -> fuses to lid on UNION
-    #   (1 - embed_pct) fraction protrudes BELOW cut   -> the visible stem
-    # _orient_matrix aligns local +Z with `no`; built mesh has base at local Z=0
-    # and tip at local Z=shaft_h.
     shaft_below = shaft_h * (1.0 - embed_pct)
     male_co     = co - no * shaft_below
-    # Female sits at the same axial position but bigger and slightly recessed so the
-    # cavity opening extends past the cut plane -- guarantees clean boolean even with
-    # small numerical offsets.
     female_recess = pitch * 0.5
     female_co     = co - no * (shaft_below + female_recess)
 
@@ -824,14 +584,12 @@ def place_screw_top(ctx, plane_co_w, plane_no_w, target_radius):
                 bpy.data.objects.remove(o, do_unlink=True)
         return None, None
 
-    # Local +Z axis -> world `no` direction (toward body across the cut)
     male_obj.matrix_world   = _orient_matrix(male_co,   no)
     female_obj.matrix_world = _orient_matrix(female_co, no)
 
     male_obj.name   = _SCREW_M_TAG
     female_obj.name = _SCREW_F_TAG
 
-    # Reuse the same scene keys as press-fit so Apply/Cancel just work
     scene["rc_joint_ball"]   = male_obj.name
     scene["rc_joint_socket"] = female_obj.name
 
@@ -847,10 +605,6 @@ def place_screw_top(ctx, plane_co_w, plane_no_w, target_radius):
 
 
 def apply_screw_top_boolean(ctx):
-    """Bake placement then:
-        male   UNION      -> limb (lid gets external threaded stem)
-        female DIFFERENCE -> body (body gets internal threaded socket)
-    """
     from .geometry import _apply_boolean
 
     scene      = ctx.scene
@@ -870,9 +624,6 @@ def apply_screw_top_boolean(ctx):
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         jobj.select_set(False)
 
-    # body = lid (gets external male thread), limb = container (gets female cavity).
-    # This is intentionally OPPOSITE to press-fit which assumes the moving piece is
-    # the limb -- for a screw-top container the static container body holds the cavity.
     print(f"[VibeCut] screw_top boolean: male UNION -> {body_obj.name} (lid)")
     _apply_boolean(body_obj, male_obj,   'UNION',      ctx)
     print(f"[VibeCut] screw_top boolean: female DIFFERENCE -> {limb_obj.name} (container)")
@@ -884,17 +635,12 @@ def apply_screw_top_boolean(ctx):
     return True
 
 
-# ---------------------------------------------------------------------------
-# Property registration
-# ---------------------------------------------------------------------------
-
 def register_props():
     bpy.types.Scene.rc_joint_file = bpy.props.EnumProperty(
         name        = "Joint",
         description = "Joint pair from the Joints/ library",
         items       = joint_enum_items,
     )
-    # Screw-top thread parameters (stored in scene units; scaled by unit_scale at use)
     bpy.types.Scene.rc_screw_pct = bpy.props.FloatProperty(
         name="Thread Diameter",
         description="External thread base radius as fraction of ring radius",

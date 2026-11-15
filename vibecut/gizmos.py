@@ -29,10 +29,6 @@ def _draw_dot(sh, pos, col, size=8.0):
     batch_for_shader(sh, 'POINTS', {"pos": [pos.to_tuple()]}).draw(sh)
 
 
-# ══════════════════════════════════════════════════
-#  Gizmo 1: Normal Slide (slide plane along limb)
-# ══════════════════════════════════════════════════
-
 class RC_GizmoNormal(bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_rc_normal"
 
@@ -91,10 +87,6 @@ class RC_GizmoNormal(bpy.types.Gizmo):
             _flush_cross()
         context.area.tag_redraw()
 
-
-# ══════════════════════════════════════════════════
-#  Gizmo 2: Lateral Slide
-# ══════════════════════════════════════════════════
 
 class RC_GizmoLateral(bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_rc_lateral"
@@ -163,10 +155,6 @@ class RC_GizmoLateral(bpy.types.Gizmo):
             _flush_cross()
         context.area.tag_redraw()
 
-
-# ══════════════════════════════════════════════════
-#  Gizmo 3: Tilt (rotate plane around view-forward)
-# ══════════════════════════════════════════════════
 
 class RC_GizmoTilt(bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_rc_tilt"
@@ -239,10 +227,6 @@ class RC_GizmoTilt(bpy.types.Gizmo):
         context.area.tag_redraw()
 
 
-# ══════════════════════════════════════════════════
-#  Gizmo 4: Resize
-# ══════════════════════════════════════════════════
-
 class RC_GizmoResize(bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_rc_resize"
 
@@ -306,10 +290,6 @@ class RC_GizmoResize(bpy.types.Gizmo):
         context.area.tag_redraw()
 
 
-# ══════════════════════════════════════════════════
-#  GizmoGroup — manages all 4 handles
-# ══════════════════════════════════════════════════
-
 class RC_GGT_cut_plane(bpy.types.GizmoGroup):
     bl_idname     = "RC_GGT_cut_plane"
     bl_label      = "Ring Cutter Handles"
@@ -334,12 +314,10 @@ class RC_GGT_cut_plane(bpy.types.GizmoGroup):
         self.gz_normal.alpha_highlight = 1.0
 
 
-
         self.gz_lateral.color          = 1.0, 0.5, 0.2
         self.gz_lateral.color_highlight = 1.0, 0.7, 0.4
         self.gz_lateral.alpha          = 0.9
         self.gz_lateral.alpha_highlight = 1.0
-
 
 
         self.gz_tilt.color          = 0.2, 0.8, 1.0
@@ -348,22 +326,16 @@ class RC_GGT_cut_plane(bpy.types.GizmoGroup):
         self.gz_tilt.alpha_highlight = 1.0
 
 
-
         self.gz_resize.color          = 1.0, 0.9, 0.2
         self.gz_resize.color_highlight = 1.0, 1.0, 0.5
         self.gz_resize.alpha          = 0.9
         self.gz_resize.alpha_highlight = 1.0
 
 
-
     def draw_prepare(self, context):
         if context.area:
             context.area.tag_redraw()
 
-
-# ══════════════════════════════════════════════════
-#  Post-cut gizmo: drag limb along cut normal
-# ══════════════════════════════════════════════════
 
 class RC_GizmoPostCutPull(bpy.types.Gizmo):
     bl_idname = "VIEW3D_GT_rc_post_pull"
@@ -442,10 +414,6 @@ class RC_GizmoPostCutPull(bpy.types.Gizmo):
         context.area.tag_redraw()
 
 
-# ══════════════════════════════════════════════════
-#  Post-cut GizmoGroup
-# ══════════════════════════════════════════════════
-
 class RC_GGT_post_cut(bpy.types.GizmoGroup):
     bl_idname      = "RC_GGT_post_cut"
     bl_label       = "Post-Cut Handles"
@@ -479,7 +447,6 @@ class RC_GGT_post_cut(bpy.types.GizmoGroup):
         self.gz_body.alpha_highlight  = 1.0
 
 
-
         self.gz_limb = g.new(RC_GizmoPostCutPull.bl_idname)
         self.gz_limb._target_prop = "rc_limb"
         self.gz_limb._direction = -1
@@ -489,15 +456,10 @@ class RC_GGT_post_cut(bpy.types.GizmoGroup):
         self.gz_limb.alpha_highlight  = 1.0
 
 
-
     def draw_prepare(self, context):
         if context.area:
             context.area.tag_redraw()
 
-
-# ══════════════════════════════════════════════════
-#  Registration
-# ══════════════════════════════════════════════════
 
 classes = (
     RC_GizmoNormal,

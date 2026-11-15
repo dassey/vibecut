@@ -1,12 +1,3 @@
-"""
-panels.py — N-panel UI for VibeCut.
-
-Panel layout:
-  - VIBECUT_PT_cutter  : Manual ring cutter + snap buttons + options
-  - VIBECUT_PT_joint   : Post-cut joint parameters + Insert Joint button
-  - VIBECUT_PT_align   : Align selected objects to active (world-space bbox)
-"""
-
 import json
 import bpy
 from .geometry import (_state, _rebuild, _pca_axis, _measure_cut_boundary,
@@ -14,17 +5,8 @@ from .geometry import (_state, _rebuild, _pca_axis, _measure_cut_boundary,
 from . import joints
 
 
-
-
-
-
-
-# ══════════════════════════════════════════════════
-#  Main cutter panel
-# ══════════════════════════════════════════════════
-
 class VIBECUT_PT_cutter(bpy.types.Panel):
-    bl_label       = "Ring Cutter v1.0.0.35"
+    bl_label       = "Ring Cutter v1.0.0.38"
     bl_idname      = "VIBECUT_PT_cutter"
     bl_space_type  = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -37,13 +19,11 @@ class VIBECUT_PT_cutter(bpy.types.Panel):
         phase = _state.get("phase", 0)
         active = _state.get("active", False)
 
-        # ── Cut Mode ────────────────────────────────
         L.row().prop(scene, "rc_cut_mode", expand=True)
         if scene.rc_cut_mode == 'DISK':
             L.row().prop(scene, "rc_disk_thickness")
         L.separator()
 
-        # ── Activate button ─────────────────────────
         row = L.row()
         row.scale_y = 1.5
         row.operator("view3d.rc_hover", text="Activate Ring Cutter",
@@ -52,9 +32,8 @@ class VIBECUT_PT_cutter(bpy.types.Panel):
 
         L.separator()
 
-        # ── Snap buttons (LOCKED only) ───────────────
         box = L.box()
-        box.enabled = (phase == 1)  # LOCKED
+        box.enabled = (phase == 1)
         box.label(text="Snap Normal To", icon='SNAP_NORMAL')
         row = box.row(align=True)
         for ax, col_name in (('X', 'X'), ('Y', 'Y'), ('Z', 'Z'), ('VIEW', 'View'), ('AUTO', 'Auto')):
@@ -62,7 +41,6 @@ class VIBECUT_PT_cutter(bpy.types.Panel):
 
         L.separator()
 
-        # ── Gizmo handle legend ───────────────────────
         box2 = L.box()
         box2.label(text="Handles (viewport)", icon='GIZMO')
         col = box2.column(align=True)
@@ -85,7 +63,6 @@ class VIBECUT_PT_cutter(bpy.types.Panel):
 
         L.separator()
 
-        # ── Cut options ───────────────────────────────
         box3 = L.box()
         box3.label(text="Cut Options", icon='CHECKBOX_HLT')
         box3.prop(scene, "rc_opt_fill")
@@ -96,19 +73,12 @@ class VIBECUT_PT_cutter(bpy.types.Panel):
 
         L.separator()
 
-        # ── CUT / BACK buttons ────────────────────────
         row3 = L.row(align=True)
-        # Enable as soon as ring cutter is active (don't require phase==1 —
-        # avoids the button being permanently grayed if phase tracking slips)
         row3.enabled = bool(active)
         row3.scale_y = 1.4
         cut = row3.operator("view3d.rc_do_cut",  text="CUT",  icon='SHADERFX')
         bk  = row3.operator("view3d.rc_do_back", text="BACK", icon='BACK')
 
-
-# ══════════════════════════════════════════════════
-#  CUT / BACK button operators
-# ══════════════════════════════════════════════════
 
 class VIBECUT_OT_do_cut(bpy.types.Operator):
     bl_idname = "view3d.rc_do_cut"
@@ -121,9 +91,6 @@ class VIBECUT_OT_do_cut(bpy.types.Operator):
         if not _state.get("active"):
             return {'CANCELLED'}
 
-        # Build a proper 3D-viewport context so _execute_cut has area/region.
-        # When called from an N-panel button the context area is the panel, not
-        # the viewport, so bpy.ops.object.mode_set etc. would fail.
         view_ctx = None
         for window in ctx.window_manager.windows:
             for area in window.screen.areas:
@@ -134,8 +101,6 @@ class VIBECUT_OT_do_cut(bpy.types.Operator):
                             view_ctx['window'] = window
                             view_ctx['area']   = area
                             view_ctx['region'] = region
-                            # ctx.copy() does NOT carry region_data — set it
-                            # explicitly so bpy.ops inside _execute_cut work.
                             for space in area.spaces:
                                 if space.type == 'VIEW_3D':
                                     view_ctx['region_data'] = space.region_3d
@@ -149,7 +114,6 @@ class VIBECUT_OT_do_cut(bpy.types.Operator):
 
         exec_ctx = view_ctx if view_ctx else ctx
         _execute_cut(exec_ctx)
-        # Signal the modal to stop on its next tick
         _state.update(active=False, phase=0, _panel_cut=True)
         if ctx.area:
             ctx.area.tag_redraw()
@@ -172,16 +136,14 @@ class VIBECUT_OT_do_back(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ══════════════════════════════════════════════════
-#  Ball & Socket joint panel
-# ══════════════════════════════════════════════════
-
 class VIBECUT_PT_joint(bpy.types.Panel):
     bl_label       = "Joint"
     bl_idname      = "VIBECUT_PT_joint"
     bl_space_type  = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category    = "VibeCut"
+    bl_parent_id   = "VIBECUT_PT_more"
+    bl_order       = 4
     bl_options     = {'DEFAULT_CLOSED'}
 
     def draw(self, ctx):
@@ -194,7 +156,6 @@ class VIBECUT_PT_joint(bpy.types.Panel):
         has_preview = (scene.get("rc_joint_ball", "") != ""
                        and scene.get("rc_joint_socket", "") != "")
 
-        # ── Cut info ────────────────────────────────────────────────────────
         if has_cut:
             info = L.box()
             c = info.column(align=True)
@@ -209,14 +170,12 @@ class VIBECUT_PT_joint(bpy.types.Panel):
 
         L.separator()
 
-        # ── Joint type selector ─────────────────────────────────────────────
         box = L.box()
         box.label(text="Joint Type", icon='CONSTRAINT_BONE')
         box.prop(scene, "rc_joint_type", expand=True)
 
         L.separator()
 
-        # ── Type-specific parameters ────────────────────────────────────────
         joint_type = getattr(scene, "rc_joint_type", "LIBRARY")
 
         if joint_type == 'LIBRARY':
@@ -230,7 +189,7 @@ class VIBECUT_PT_joint(bpy.types.Panel):
             pbox.prop(scene, "rc_pin_pct",       slider=True)
             pbox.prop(scene, "rc_pin_depth")
             pbox.prop(scene, "rc_pin_tolerance")
-        else:  # SCREW_TOP
+        else:
             pbox = L.box()
             pbox.label(text="Screw Top Parameters", icon='RECOVER_LAST')
             pbox.prop(scene, "rc_screw_pct",       slider=True)
@@ -243,7 +202,6 @@ class VIBECUT_PT_joint(bpy.types.Panel):
         L.separator()
 
         if not has_preview:
-            # ── State A/B: no preview placed yet ─────────────────────────
             row = L.row()
             row.scale_y = 1.6
             row.enabled = has_cut
@@ -251,7 +209,6 @@ class VIBECUT_PT_joint(bpy.types.Panel):
                          text="Place Joint",
                          icon='IMPORT')
         else:
-            # ── State C: preview placed, waiting for user to position ─────
             L.label(text="Move/rotate the joint, then:", icon='PIVOT_CURSOR')
 
             col = L.column(align=True)
@@ -263,10 +220,6 @@ class VIBECUT_PT_joint(bpy.types.Panel):
                          text="Cancel",
                          icon='X')
 
-
-# ══════════════════════════════════════════════════
-#  Place joint operator
-# ══════════════════════════════════════════════════
 
 class VIBECUT_OT_place_joint(bpy.types.Operator):
     bl_description = ("Preview a joint at the last cut. Nothing is committed until "
@@ -326,7 +279,7 @@ class VIBECUT_OT_place_joint(bpy.types.Operator):
                 self.report({'ERROR'}, "Screw-top placement failed — check console.")
                 return {'CANCELLED'}
 
-        else:  # LIBRARY
+        else:
             blend_file = getattr(scene, "rc_joint_file", "none")
             if not blend_file or blend_file == "none":
                 self.report({'WARNING'}, "No joint selected.")
@@ -351,10 +304,6 @@ class VIBECUT_OT_place_joint(bpy.types.Operator):
                 return {'CANCELLED'}
 
 
-# ══════════════════════════════════════════════════
-#  Apply joint boolean operator
-# ══════════════════════════════════════════════════
-
 class VIBECUT_OT_apply_joint(bpy.types.Operator):
     bl_description = "Boolean the previewed joint into the two halves for good"
     bl_idname  = "mesh.rc_apply_joint"
@@ -377,10 +326,6 @@ class VIBECUT_OT_apply_joint(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-# ══════════════════════════════════════════════════
-#  Cancel joint placement operator
-# ══════════════════════════════════════════════════
-
 class VIBECUT_OT_cancel_joint(bpy.types.Operator):
     bl_description = "Discard the joint preview and leave the halves untouched"
     bl_idname  = "mesh.rc_cancel_joint"
@@ -392,10 +337,6 @@ class VIBECUT_OT_cancel_joint(bpy.types.Operator):
         self.report({'INFO'}, "Joint placement cancelled.")
         return {'FINISHED'}
 
-
-# ══════════════════════════════════════════════════
-#  Legacy one-shot operator (kept for scripting)
-# ══════════════════════════════════════════════════
 
 class VIBECUT_OT_insert_joint(bpy.types.Operator):
     bl_idname  = "mesh.rc_insert_joint"
@@ -448,10 +389,6 @@ class VIBECUT_OT_insert_joint(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-# ══════════════════════════════════════════════════
-#  Align Tools panel + operator
-# ══════════════════════════════════════════════════
-
 class VIBECUT_OT_align_to_active(bpy.types.Operator):
     """Align selected objects to the active object along chosen axes"""
     bl_idname  = "vibecut.align_to_active"
@@ -484,7 +421,7 @@ class VIBECUT_OT_align_to_active(bpy.types.Operator):
             return min(vals)
         if self.mode == 'BOUNDS_MAX':
             return max(vals)
-        return (min(vals) + max(vals)) * 0.5  # BOUNDS_CENTER
+        return (min(vals) + max(vals)) * 0.5
 
     def invoke(self, ctx, event):
         return ctx.window_manager.invoke_props_dialog(self)
@@ -573,10 +510,6 @@ class VIBECUT_PT_align(bpy.types.Panel):
                      icon='TRIA_DOWN_BAR')
 
 
-# ══════════════════════════════════════════════════
-#  Registration
-# ══════════════════════════════════════════════════
-
 classes = (
     VIBECUT_PT_cutter,
     VIBECUT_PT_joint,
@@ -600,4 +533,3 @@ def register():
 def unregister():
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
-

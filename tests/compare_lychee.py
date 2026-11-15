@@ -1,22 +1,3 @@
-"""Compare VibeCut PINS supports against Lychee Slicer supports.
-
-The Example STLs were exported from Lychee WITH supports baked in. The
-largest loose part is the model; everything else is Lychee's support.
-We strip Lychee's supports, run run_pipeline() on the bare model, and
-measure both support sets with the SAME metric:
-
-  contacts  - support verts within CONTACT_TOL of the model surface,
-              clustered to 1 mm. Split by the model normal there:
-              tip  = touches an overhang (normal points down)
-              rest = stands ON the model (normal points up) = a scar
-  bed parts - support loose parts that reach z ~ 0
-  recall    - % of Lychee tip contacts with one of ours within MATCH_MM
-  precision - % of our tip contacts within MATCH_MM of a Lychee one
-
-Usage:
-  blender -b --factory-startup -P tests/compare_lychee.py -- [pose numbers] [--save]
-Saves Example/compare_pose<N>.blend (Lychee red, ours green) with --save.
-"""
 import bpy, bmesh, sys, os, json, time, importlib.util
 import numpy as np
 from mathutils import Vector
@@ -32,18 +13,17 @@ S = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(S)
 
 CONTACT_TOL = 0.3
-CLUSTER_MM = 2.0     # one contact patch per 2 mm (our trimmed tips are ~1 mm discs)
-FOOT_MM = 3.0        # bed footprint clustering
+CLUSTER_MM = 2.0
+FOOT_MM = 3.0
 MATCH_MM = 3.0
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 SAVE = "--save" in argv
 POSES = [int(a) for a in argv if a.isdigit()] or [1, 2, 3, 4]
-OVERRIDES = [a for a in argv if '=' in a]   # e.g. pin_spacing=3.5
+OVERRIDES = [a for a in argv if '=' in a]
 
 
 def split_largest(ob):
-    """Separate ob into (model_obj, support_obj) by loose parts."""
     me = ob.data
     n = len(me.vertices)
     ev = np.empty(len(me.edges) * 2, dtype=np.int64)
@@ -89,7 +69,6 @@ def model_bvh(model):
 
 
 def measure(sup, bvh):
-    """Contacts (tip/rest) + bed part count for a support object."""
     me = sup.data
     co = np.empty(len(me.vertices) * 3)
     me.vertices.foreach_get("co", co)
@@ -104,7 +83,6 @@ def measure(sup, bvh):
         (tips if hit[1].z < 0 else rests).append(hit[0])
 
     def cluster(pts):
-        """Greedy 1 mm clustering: one representative per contact patch."""
         if not pts:
             return []
         kd = KDTree(len(pts))
@@ -121,16 +99,12 @@ def measure(sup, bvh):
                 dead.add(j)
         return out
     tips, rests = cluster(tips), cluster(rests)
-    # A wide tip on a curved surface has part of its patch facing up;
-    # that is the same contact, not a separate rest.
     if tips and rests:
         kd = KDTree(len(tips))
         for i, p in enumerate(tips):
             kd.insert(p, i)
         kd.balance()
         rests = [p for p in rests if kd.find(p)[2] > 1.5]
-    # Bed feet: support verts on the floor, clustered in XY. Overlapping
-    # pads merge, so this counts footprints, not primitives.
     wz = np.array([(mw @ Vector(p)).z for p in co]) if len(co) else np.zeros(0)
     zmin = wz.min() if len(wz) else 0.0
     floor = [Vector((p[0], p[1], 0.0)) for p, z in zip(co, wz) if z < zmin + 0.2]
@@ -166,8 +140,6 @@ def match(a, b, tol):
 
 
 def render_views(out_dir, stem):
-    """Workbench renders, Lychee (left, red) vs ours (right, green):
-    front, back, and from below."""
     os.makedirs(out_dir, exist_ok=True)
     sc = bpy.context.scene
     sc.render.engine = 'BLENDER_WORKBENCH'
@@ -201,9 +173,6 @@ def render_views(out_dir, stem):
 
 
 def diagnose(n, l_tips, o_tips, bvh):
-    """Histogram of surface steepness (deg below horizontal-facing; 90 =
-    face points straight down) for matched / missed Lychee tips and for
-    our tips Lychee does not have."""
     import math
 
     def sev(p):
@@ -254,8 +223,6 @@ for n in POSES:
     rep = S.run_pipeline(model, P, collection=coll)
     dt = time.time() - t0
     ours = bpy.data.objects.get(rep["support_object"] or "")
-    # Lychee lifts the model; run_pipeline dropped it. Drop Lychee's
-    # supports by the same amount so both sit in one frame.
     lsup.location.z -= lift
     for p in l_tips + l_rests:
         p.z -= lift
@@ -288,7 +255,6 @@ for n in POSES:
         if ours:
             ours.data.materials.clear()
             ours.data.materials.append(mat("ours_green", (0.2, 0.85, 0.3, 1)))
-            # side by side: ours + a model copy shifted +X
             span = model.dimensions.x + 15
             m2 = model.copy()
             bpy.context.scene.collection.objects.link(m2)

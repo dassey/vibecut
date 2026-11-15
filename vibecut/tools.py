@@ -1,11 +1,3 @@
-# VibeCut Tools panel - first-pass prep for 2D->3D (AI-generated) meshes
-# plus one-off fixers: round hole fill, make round, flat bottom, symmetrize,
-# thin-wall check, even remesh, scale to size.
-#
-# Self-contained (no intra-package imports) so tests/run_tests.py can load it
-# standalone via importlib, like supports.py. Core work lives in plain
-# functions on bmesh / objects; operators are thin wrappers.
-
 import heapq
 import math
 
@@ -17,10 +9,6 @@ from mathutils import kdtree
 from mathutils.geometry import intersect_point_line
 import numpy as np
 
-
-# --------------------------------------------------------------------------
-# Small helpers
-# --------------------------------------------------------------------------
 
 def _mesh_objects(ctx):
     obs = [o for o in ctx.selected_objects if o.type == 'MESH']
@@ -53,7 +41,6 @@ def _diag(bm):
 
 
 def _boundary_loops(edges):
-    """Group boundary edges into connected loops (lists of edges)."""
     edges = set(edges)
     loops = []
     while edges:
@@ -72,7 +59,6 @@ def _boundary_loops(edges):
 
 
 def fit_sphere(points):
-    """Least-squares sphere through points -> (center Vector, radius)."""
     import numpy as np
     Q = np.array([tuple(p) for p in points], dtype=float)
     if len(Q) < 4:
@@ -86,7 +72,6 @@ def fit_sphere(points):
 
 
 def _apply_modifier_stack(ob):
-    """Bake ob's modifiers into its mesh without operators."""
     dg = bpy.context.evaluated_depsgraph_get()
     me = bpy.data.meshes.new_from_object(ob.evaluated_get(dg))
     old = ob.data
@@ -96,12 +81,7 @@ def _apply_modifier_stack(ob):
         bpy.data.meshes.remove(old)
 
 
-# --------------------------------------------------------------------------
-# Core steps (each returns a short human-readable result string)
-# --------------------------------------------------------------------------
-
 def apply_rot_scale(ob):
-    """Bake rotation + scale into the mesh (location kept)."""
     if ob.data.users > 1:
         return "skipped apply (mesh shared by %d objects)" % ob.data.users
     loc, rot, scl = ob.matrix_basis.decompose()
@@ -124,10 +104,6 @@ def merge_close(bm, dist):
 
 
 def delete_loose(bm, min_island_frac, min_size_frac=0.02):
-    """Remove verts/edges with no faces and floating islands that are
-    small in face count (< min_island_frac of all faces) OR in size
-    (< min_size_frac of the model's diagonal). The biggest island is
-    always kept. Returns (loose_geometry_removed, islands_removed)."""
     loose_e = [e for e in bm.edges if not e.link_faces]
     bmesh.ops.delete(bm, geom=loose_e, context='EDGES')
     loose_v = [v for v in bm.verts if not v.link_faces]
@@ -181,16 +157,12 @@ def dissolve_degenerate(bm, dist):
 
 
 def fix_normals(bm):
-    """Point every shell's faces outward. Returns True if any shell was
-    inside-out before."""
     before = bm.calc_volume(signed=True)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     return before < 0
 
 
 def fill_holes(bm, max_sides):
-    """Fill every hole with up to max_sides edges (beauty-triangulated).
-    Returns (filled, left_open)."""
     loops = _boundary_loops([e for e in bm.edges if e.is_boundary])
     filled = left = 0
     for loop in loops:
@@ -235,7 +207,6 @@ def drop_to_floor(ob):
 
 
 def mesh_report(ob):
-    """Printability facts for one object (world-space dims)."""
     bm = _open(ob.data)
     nm = sum(1 for e in bm.edges if not e.is_manifold)
     holes = len(_boundary_loops([e for e in bm.edges if e.is_boundary]))
@@ -271,8 +242,6 @@ def mesh_report(ob):
 
 
 def prep_new_model(ob, opts):
-    """The all-in-one first pass. opts: dict of step toggles + values.
-    Returns (list of step strings, final report dict)."""
     log = []
     if opts.get("apply", True):
         log.append(apply_rot_scale(ob))
@@ -315,10 +284,6 @@ REMESH_MAX_FACES = 2000000
 
 
 def voxel_remesh(ob, voxel, max_faces=REMESH_MAX_FACES):
-    """Even, watertight quad mesh (Voxel Remesh). The voxel grows if the
-    estimate (surface area / voxel^2) would pass max_faces - a too-fine
-    voxel on a big model locks Blender up. Returns (faces before, faces
-    after, voxel used)."""
     f0 = len(ob.data.polygons)
     sx, sy, sz = ob.matrix_world.to_scale()
     area = sum(p.area for p in ob.data.polygons) *         max(abs(sx), abs(sy), abs(sz)) ** 2
@@ -346,10 +311,6 @@ def decimate_to(ob, target_faces):
 
 
 def scale_to_size(ob, size_mm, axis):
-    """Uniform scale so the chosen dimension ('MAX', 'X', 'Y', 'Z') equals
-    size_mm, then apply."""
-    # Dimensions ignore rotation (glTF imports arrive rotated 90 deg), so
-    # bake rotation first - then X/Y/Z are the real world sides.
     apply_rot_scale(ob)
     d = ob.dimensions
     cur = {"X": d.x, "Y": d.y, "Z": d.z}.get(axis, max(d))
@@ -363,8 +324,6 @@ def scale_to_size(ob, size_mm, axis):
 
 
 def flat_bottom(ob, height):
-    """Cut everything below (lowest point + height) and cap it flat, so the
-    model stands on the bed. Returns the number of caps made."""
     bpy.context.view_layer.update()
     mw = ob.matrix_world.copy()
     zmin = min((mw @ v.co).z for v in ob.data.vertices)
@@ -396,8 +355,6 @@ def symmetrize(bm, direction, dist):
 
 
 def thin_wall_faces(ob, min_mm):
-    """Faces whose wall (ray inward along -normal) is thinner than min_mm.
-    World space. Returns list of polygon indices."""
     me = ob.data
     mw = ob.matrix_world
     nmat = mw.to_3x3().inverted().transposed()
@@ -415,8 +372,6 @@ def thin_wall_faces(ob, min_mm):
 
 
 def make_round(bm, verts):
-    """Project verts onto their own best-fit sphere. Returns (center, r,
-    max move)."""
     if len(verts) < 4:
         return None, 0.0, 0.0
     c, r = fit_sphere([v.co for v in verts])
@@ -431,9 +386,6 @@ def make_round(bm, verts):
 
 
 def fill_hole_round(bm, loop_edges, rings=3):
-    """Fill one hole and bulge the patch onto the sphere fitted to the
-    surface around it (rings of neighbour verts). Returns (center, r,
-    patch_faces)."""
     loop_verts = {v for e in loop_edges for v in e.verts}
     ring = set(loop_verts)
     frontier = set(loop_verts)
@@ -490,15 +442,7 @@ def fill_hole_round(bm, loop_edges, rings=3):
     return c, r, len(patch)
 
 
-
-# --------------------------------------------------------------------------
-# Straighten Wall Band
-# --------------------------------------------------------------------------
-
 def _xy_order(verts, P):
-    """Arc-length-ish coordinate along a selected wall strip: Dijkstra over
-    the selected edges weighted by XY length only (going up/down the wall is
-    free), started from the far end (double sweep). Works for any bend."""
     idx = {v: i for i, v in enumerate(verts)}
     nbr = [[] for _ in verts]
     for v in verts:
@@ -532,8 +476,6 @@ def _xy_order(verts, P):
 
 
 def _moving_avg(y, k):
-    """Savitzky-Golay style smoothing (local QUADRATIC fit per window): a
-    plain moving average shrinks curves inward (0.4 mm on an R40 arc)."""
     n = len(y)
     if k <= 2 or n < 4:
         return y
@@ -551,7 +493,6 @@ def _moving_avg(y, k):
 
 
 def _catmull(C, sub=6):
-    """Catmull-Rom upsample of a polyline (smooth curve, not chords)."""
     if len(C) < 3:
         return C
     P = np.r_[C[:1] * 2 - C[1:2], C, C[-1:] * 2 - C[-2:-1]]
@@ -567,7 +508,6 @@ def _catmull(C, sub=6):
 
 
 def _project_polyline(Q, C):
-    """Closest point on polyline C (n,2) for each Q (m,2): (points, arc s)."""
     A, B = C[:-1], C[1:]
     AB = B - A
     L2 = np.maximum((AB ** 2).sum(1), 1e-12)
@@ -593,44 +533,25 @@ def _project_polyline(Q, C):
 
 
 def straighten_wall(verts, mw, vertical=True, edges='STRAIGHT', smooth=9):
-    """Clean up a jagged wall strip (selected verts) while keeping its curve.
-
-    vertical: slide every vertex straight in/out (XY only) onto a smooth
-      curve fitted through the strip's footprint - faces end up vertical
-      ("flattened to the XY axis"), the curve is kept.
-    edges: 'STRAIGHT' - top edge = straight line between the two top
-      corners, bottom edge = straight line between the two bottom corners
-      (along the curve); 'SMOOTH' - top/bottom edges smoothed but follow
-      their overall rise and fall; 'KEEP' - heights untouched.
-      Every vertex in between is re-spaced proportionally, so stray
-      vertices come into line too.
-    Returns a dict of stats, or None if fewer than 6 verts / no edges."""
     if len(verts) < 6:
         return None
     imw = mw.inverted()
     P = np.array([tuple(mw @ v.co) for v in verts])
     s, reach = _xy_order(verts, P)
     if not reach.all():
-        # several disconnected bits selected: keep the biggest connected one
         verts = [v for v, ok in zip(verts, reach) if ok]
         P, s = P[reach], s[reach]
     total = float(s.max())
     if total < 1e-6:
         return None
-    # Bins along the strip (about 2 edge lengths each, 8..400 bins).
     elen = [e.calc_length() for v in verts[:2000] for e in v.link_edges]
     bin_len = max(total / 400.0, 2.0 * float(np.median(elen)) if elen else 0)
     nb = int(np.clip(round(total / max(bin_len, 1e-9)), 8, 400))
     def fit_curve(pos):
-        """Footprint curve from bin means along `pos` (0..1)."""
         bi = np.minimum((pos * nb).astype(int), nb - 1)
         used = np.unique(bi)
         c_ = np.array([P[bi == b, :2].mean(0) for b in used])
         c_ = _moving_avg(c_, smooth)
-        # Extend both ends 3 bins so end vertices don't get dragged onto an
-        # endpoint - QUADRATIC extrapolation of the last few points, so the
-        # extension keeps bending with the wall (a straight one put the end
-        # columns 0.2 mm off an R40 arc).
         if len(c_) >= 2:
             k = min(len(c_), 6)
             deg = 2 if k >= 4 else 1
@@ -645,23 +566,15 @@ def straighten_wall(verts, mw, vertical=True, edges='STRAIGHT', smooth=9):
             c_ = np.r_[head, c_, tail]
         return _catmull(c_)
 
-    # Pass 1 bins by walking distance over the mesh; pass 2 re-bins by the
-    # position along the fitted curve itself (two sheets of a thick wall
-    # walk different lengths - inner is shorter - which skewed the ends).
     cxy = fit_curve(s / total)
     _, sp1, _ = _project_polyline(P[:, :2], cxy)
     cxy = fit_curve((sp1 - sp1.min()) / max(np.ptp(sp1), 1e-9))
     proj, sp, tan = _project_polyline(P[:, :2], cxy)
-    # Signed in/out offset from the curve. Two sheets selected (outside AND
-    # inside of a thick wall) -> keep each sheet at its own median offset so
-    # the wall keeps its thickness instead of collapsing onto the curve.
     nrm = np.c_[-tan[:, 1], tan[:, 0]]
     off = ((P[:, :2] - proj) * nrm).sum(1)
     target = np.full(len(off), float(np.median(off)))
     srt = np.sort(off)
     if len(srt) > 20:
-        # Otsu split (max between-group variance), then check the groups are
-        # really apart using ROBUST spreads (a few end points bridge the gap).
         n_ = len(srt)
         cs = np.cumsum(srt)
         i = np.arange(1, n_)
@@ -675,8 +588,6 @@ def straighten_wall(verts, mw, vertical=True, edges='STRAIGHT', smooth=9):
         if (len(a_) > 0.1 * n_ and len(b_) > 0.1 * n_
                 and np.median(b_) - np.median(a_)
                 > 4.0 * max(mad(a_), mad(b_), 1e-6)):
-            # Label sheets per short stretch (local split), so a local curve
-            # error shifts both sheets alike instead of mislabelling ends.
             ma, mb = float(np.median(a_)), float(np.median(b_))
             spn = (sp - sp.min()) / max(np.ptp(sp), 1e-9)
             lb = np.minimum((spn * nb).astype(int), nb - 1)
@@ -711,9 +622,6 @@ def straighten_wall(verts, mw, vertical=True, edges='STRAIGHT', smooth=9):
         lo = bnd & (z <= zmin[bi] + 0.35 * rng_b)
         if hi.sum() < 2 or lo.sum() < 2:
             hi, lo = z >= zmax[bi] - 1e-9, z <= zmin[bi] + 1e-9
-        # End columns: every vertex there is on the selection boundary, but
-        # only the top-most / bottom-most one is a corner; the rest are
-        # interior points (else they get snapped to an edge and rows cross).
         xy_e = [math.hypot(*(mw @ e.verts[0].co - mw @ e.verts[1].co).xy)
                 for v in verts[:3000] for e in v.link_edges]
         xy_e = [d for d in xy_e if d > 1e-6]
@@ -734,7 +642,6 @@ def straighten_wall(verts, mw, vertical=True, edges='STRAIGHT', smooth=9):
         def edge_line(mask, pick):
             o = np.argsort(sn[mask])
             ss, zz = sn[mask][o], z[mask][o]
-            # one height per bin (the extreme one), then interpolate
             bb = np.minimum((ss * nb).astype(int), nb - 1)
             keys = np.unique(bb)
             xs = np.array([ss[bb == k].mean() for k in keys])
@@ -746,12 +653,9 @@ def straighten_wall(verts, mw, vertical=True, edges='STRAIGHT', smooth=9):
         zt_old = np.interp(sn, tx, ty)
         zb_old = np.interp(sn, bx, by)
         if edges == 'STRAIGHT':
-            # The CORNER vertices define the edges - the
-            # top line runs from the first to the last top-edge vertex along
-            # the strip, the bottom line likewise.
             if len(corners) == 2:
                 (ta, ba), (tb, bb_) = corners
-            else:                                   # degenerate strip
+            else:
                 hi_i, lo_i = np.flatnonzero(hi), np.flatnonzero(lo)
                 ta, tb = hi_i[np.argmin(sn[hi_i])], hi_i[np.argmax(sn[hi_i])]
                 ba, bb_ = lo_i[np.argmin(sn[lo_i])], lo_i[np.argmax(sn[lo_i])]
@@ -778,10 +682,6 @@ def straighten_wall(verts, mw, vertical=True, edges='STRAIGHT', smooth=9):
             "moved_xy": moved_xy if vertical else 0.0, "moved_z": moved_z}
 
 
-# --------------------------------------------------------------------------
-# Snap Loop to Loop (with zip pass)
-# --------------------------------------------------------------------------
-
 def _edge_components(sel_edges):
     adj = {}
     for e in sel_edges:
@@ -806,8 +706,6 @@ def _edge_components(sel_edges):
 
 
 def _project_onto_chain(points, chain_verts, chain_edges, k):
-    """For each point: nearest spot on the edge chain -> (edge, fac, co).
-    Checks the edges of the k nearest chain verts (KD-tree)."""
     lst = list(chain_verts)
     kd = kdtree.KDTree(len(lst))
     for i, v in enumerate(lst):
@@ -833,8 +731,6 @@ def _project_onto_chain(points, chain_verts, chain_edges, k):
 
 
 def _split_at(bm, per_edge, tol, targetmap, map_new_to):
-    """Split edges at the given (fac, key, co) spots. map_new_to(key, new_v)
-    records which vert the new one is welded with."""
     for e, items in per_edge.items():
         if not e.is_valid:
             continue
@@ -855,13 +751,6 @@ def _split_at(bm, per_edge, tol, targetmap, map_new_to):
 
 def snap_loop_to_loop(bm, mw, move='HIGHER', weld=True, zip_seam=True,
                       tol=1e-5, k=8):
-    """Move one selected edge loop onto the other (2 separate loops/chains
-    of selected edges). move: which one moves - HIGHER / LOWER (average
-    world Z) or SHORTER / LONGER. weld: merge it into the target (one
-    watertight seam). zip_seam: ALSO split the moving loop at target verts
-    that fall between moved verts - without it, unequal vertex counts leave
-    overlapping-but-unshared edges (T-junctions: not watertight).
-    Returns stats dict. Raises ValueError with a plain message."""
     sel_edges = [e for e in bm.edges if e.select]
     loops = _edge_components(sel_edges)
     if len(loops) != 2:
@@ -917,8 +806,6 @@ def snap_loop_to_loop(bm, mw, move='HIGHER', weld=True, zip_seam=True,
     target_now = {v for v in target if v.is_valid} | set(targetmap.values())
 
     if zip_seam:
-        # Target verts not matched by a moved vert: split the moving loop
-        # there and weld the new vert onto that target vert.
         matched = set(targetmap.values())
         m_edges = {e for e in m_edges if e.is_valid}
         loose_t = [(tv, tv.co.copy()) for tv in target_now
@@ -926,10 +813,8 @@ def snap_loop_to_loop(bm, mw, move='HIGHER', weld=True, zip_seam=True,
         zhits = _project_onto_chain(loose_t, moving, m_edges, k)
         per_m = {}
         for tv, (e, fac, q) in zhits.items():
-            # On a curved seam a target vert sits off the moved chord by the
-            # curve's sag - allow up to a quarter of that edge's length.
             if (q - tv.co).length > max(0.25 * e.calc_length(), tol):
-                continue                       # not on the seam
+                continue
             a, b = e.verts
             if (tv.co - a.co).length <= tol or (tv.co - b.co).length <= tol:
                 continue
@@ -959,12 +844,8 @@ def snap_loop_to_loop(bm, mw, move='HIGHER', weld=True, zip_seam=True,
                                    if len(e.link_faces) != 2)
     return stats
 
-# --------------------------------------------------------------------------
-# Properties
-# --------------------------------------------------------------------------
 
 class VibeCutToolProps(bpy.types.PropertyGroup):
-    # All-in-one step toggles
     do_apply: bpy.props.BoolProperty(name="Apply Rotation/Scale",
                                      default=True)
     do_fill: bpy.props.BoolProperty(name="Fill Holes", default=True)
@@ -991,7 +872,6 @@ class VibeCutToolProps(bpy.types.PropertyGroup):
         description="Neighbouring faces flatter than this (degrees) merge "
         "into one. Higher = fewer faces")
 
-    # Individual tools
     smooth_iter: bpy.props.IntProperty(name="Smooth Passes", default=3,
                                        min=1, max=50)
     smooth_strength: bpy.props.FloatProperty(name="Smooth Strength",
@@ -1066,10 +946,6 @@ def _props(ctx):
 def _set_status(ctx, lines):
     _props(ctx).status = " | ".join(lines)
 
-
-# --------------------------------------------------------------------------
-# Operators - Object mode
-# --------------------------------------------------------------------------
 
 class _ObjectTool(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
@@ -1243,9 +1119,6 @@ class VIBECUT_OT_tool_smooth(_ObjectTool):
 
 
 def _close_for_remesh(ob):
-    """Voxel remesh needs a closed volume: an open mesh collapses to
-    nothing. Fill every hole (any size) and point faces outward first.
-    Returns a note for the status line, or ''."""
     if mesh_report(ob)["holes"] == 0:
         return ""
     bm = _open(ob.data)
@@ -1375,10 +1248,6 @@ class VIBECUT_OT_tool_drop(_ObjectTool):
                           for o in _mesh_objects(ctx)])
         return {'FINISHED'}
 
-
-# --------------------------------------------------------------------------
-# Operators - Edit mode
-# --------------------------------------------------------------------------
 
 class _EditTool(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
@@ -1527,9 +1396,21 @@ class VIBECUT_OT_tool_thin_walls(_EditTool):
         return {'FINISHED'}
 
 
-# --------------------------------------------------------------------------
-# Panel
-# --------------------------------------------------------------------------
+class _ToolsSection:
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "VibeCut"
+    bl_parent_id = "VIBECUT_PT_tools"
+    _icon = 'NONE'
+
+    def draw_header(self, ctx):
+        self.layout.label(icon=self._icon)
+
+
+def _edit_hint(layout, ctx):
+    if ctx.mode == 'OBJECT':
+        layout.label(text="Tab into Edit Mode to use these.", icon='INFO')
+
 
 class VIBECUT_PT_tools(bpy.types.Panel):
     bl_label = "Tools"
@@ -1566,12 +1447,22 @@ class VIBECUT_PT_tools(bpy.types.Panel):
             b = L.box()
             for chunk in p.status.split(" | "):
                 b.label(text=chunk)
+        ob = ctx.active_object
+        if ctx.mode == 'EDIT_MESH' and ob is not None and ob.type == 'MESH':
+            r = L.row()
+            r.scale_y = 0.85
+            r.label(text="V: {:,}   F: {:,}".format(
+                len(ob.data.vertices), len(ob.data.polygons)), icon='MESH_DATA')
 
-        # One step at a time (same steps the all-in-one runs).
-        b = L.box()
-        b.label(text="Cleanup Steps", icon='BRUSH_DATA')
-        c = b.column(align=True)
-        c.enabled = obj_mode
+
+class VIBECUT_PT_tools_cleanup(_ToolsSection, bpy.types.Panel):
+    bl_label = "Cleanup Steps"
+    bl_idname = "VIBECUT_PT_tools_cleanup"
+    _icon = 'BRUSH_DATA'
+
+    def draw(self, ctx):
+        c = self.layout.column(align=True)
+        c.enabled = ctx.mode == 'OBJECT'
         c.operator("vibecut.tool_apply", icon='OBJECT_ORIGIN')
         c.operator("vibecut.tool_merge", icon='AUTOMERGE_OFF')
         c.operator("vibecut.tool_loose", icon='TRASH')
@@ -1581,27 +1472,44 @@ class VIBECUT_PT_tools(bpy.types.Panel):
         c.operator("vibecut.tool_dissolve", icon='MOD_DECIM')
         c.operator("vibecut.tool_drop", icon='TRIA_DOWN_BAR')
 
-        # Topology: triangles -> quads / even spacing.
-        b = L.box()
-        b.label(text="Triangles -> Quads / Even Mesh", icon='MESH_GRID')
-        c = b.column(align=True)
-        c.enabled = obj_mode
+
+class VIBECUT_PT_tools_quads(_ToolsSection, bpy.types.Panel):
+    bl_label = "Triangles -> Quads"
+    bl_idname = "VIBECUT_PT_tools_quads"
+    _icon = 'MESH_GRID'
+
+    def draw(self, ctx):
+        p = _props(ctx)
+        S = ctx.scene
+        c = self.layout.column(align=True)
+        c.enabled = ctx.mode == 'OBJECT'
         c.prop(p, "voxel")
         c.operator("vibecut.tool_remesh", icon='MOD_REMESH')
         c.prop(p, "target_faces")
         c.operator("vibecut.tool_quadriflow", icon='MOD_REMESH')
         c.operator("vibecut.tool_decimate", icon='MOD_DECIM')
+        c.separator()
+        c.prop(S, "vibecut_mt_quad_sharp")
+        c.prop(S, "vibecut_mt_quad_planar")
+        c.prop(S, "vibecut_mt_quad_duplicate")
         c.operator("vibecut.quad_convert", text="Flat Panels (keep shape)",
                    icon='MOD_TRIANGULATE')
+        c.separator()
         c.prop(p, "smooth_iter")
         c.prop(p, "smooth_strength")
         c.operator("vibecut.tool_smooth", icon='MOD_SMOOTH')
 
-        # Printing / articulation helpers.
-        b = L.box()
-        b.label(text="Print & Articulation", icon='MOD_BUILD')
-        c = b.column(align=True)
-        c.enabled = obj_mode
+
+class VIBECUT_PT_tools_print(_ToolsSection, bpy.types.Panel):
+    bl_label = "Print & Articulation"
+    bl_idname = "VIBECUT_PT_tools_print"
+    bl_options = {'DEFAULT_CLOSED'}
+    _icon = 'MOD_BUILD'
+
+    def draw(self, ctx):
+        p = _props(ctx)
+        c = self.layout.column(align=True)
+        c.enabled = ctx.mode == 'OBJECT'
         r = c.row(align=True)
         r.prop(p, "size_mm")
         r.prop(p, "size_axis", text="")
@@ -1611,39 +1519,158 @@ class VIBECUT_PT_tools(bpy.types.Panel):
         c.prop(p, "sym_dir")
         c.operator("vibecut.tool_symmetrize", icon='MOD_MIRROR')
 
-        b = L.box()
-        b.label(text="Edit Mode (select first)", icon='EDITMODE_HLT')
-        c = b.column(align=True)
-        c.enabled = not obj_mode
+
+class VIBECUT_PT_tools_bevel(_ToolsSection, bpy.types.Panel):
+    bl_label = "Auto Bevel"
+    bl_idname = "VIBECUT_PT_tools_bevel"
+    bl_options = {'DEFAULT_CLOSED'}
+    _icon = 'MOD_BEVEL'
+
+    def draw(self, ctx):
+        S = ctx.scene
+        L = self.layout
+        c = L.column(align=True)
+        c.prop(S, "vibecut_mt_bevel_width")
+        c.prop(S, "vibecut_mt_bevel_segments")
+        c.prop(S, "vibecut_mt_bevel_angle")
+        r = L.row()
+        r.scale_y = 1.2
+        if ctx.mode == 'EDIT_MESH':
+            r.operator("vibecut.bevel_sharp_edges", icon='MOD_BEVEL')
+        else:
+            r.operator("vibecut.auto_bevel", icon='MOD_BEVEL')
+
+
+class VIBECUT_PT_tools_click_collapse(_ToolsSection, bpy.types.Panel):
+    bl_label = "Click Collapse"
+    bl_idname = "VIBECUT_PT_tools_click_collapse"
+    _icon = 'AUTOMERGE_ON'
+
+    def draw(self, ctx):
+        L = self.layout
+        cap = L.column(align=True)
+        cap.scale_y = 0.8
+        cap.label(text="Click a vertex: it merges into the")
+        cap.label(text="closest vertex it is connected to.")
+        cap.label(text="Orange = goes away, green = stays.")
+        running = getattr(ctx.window_manager, "vibecut_cc_running", False)
+        r = L.row()
+        r.scale_y = 1.4
+        r.enabled = ctx.mode != 'OBJECT'
+        if running:
+            r.operator("vibecut.click_collapse", text="Stop Click Collapse",
+                       icon='CANCEL', depress=True)
+            L.label(text="Right-click or Esc also stops.", icon='INFO')
+        else:
+            r.operator("vibecut.click_collapse", icon='AUTOMERGE_ON')
+        _edit_hint(L, ctx)
+
+
+class VIBECUT_PT_tools_round(_ToolsSection, bpy.types.Panel):
+    bl_label = "Round & Thin"
+    bl_idname = "VIBECUT_PT_tools_round"
+    bl_parent_id = "VIBECUT_PT_more"
+    bl_order = 5
+    bl_options = {'DEFAULT_CLOSED'}
+    _icon = 'SPHERECURVE'
+
+    def draw(self, ctx):
+        p = _props(ctx)
+        L = self.layout
+        c = L.column(align=True)
+        c.enabled = ctx.mode != 'OBJECT'
+        c.label(text="Select part of the mesh first.")
         c.operator("vibecut.tool_fill_round", icon='SPHERE')
         c.operator("vibecut.tool_make_round", icon='SPHERECURVE')
         c.prop(p, "thin_mm")
         c.operator("vibecut.tool_thin_walls", icon='MOD_THICKNESS')
-        c.separator()
-        c.prop(p, "wall_vertical")
-        c.prop(p, "wall_edges", text="")
-        c.prop(p, "wall_smooth")
-        c.operator("vibecut.tool_straighten_wall", icon='CURVE_PATH')
-        c.separator()
-        c.prop(p, "loop_move", text="Move")
-        c.prop(p, "loop_weld")
-        c.prop(p, "loop_zip")
-        c.operator("vibecut.tool_snap_loop", icon='SNAP_EDGE')
-        if obj_mode:
-            b.label(text="Tab into Edit Mode to use these.", icon='INFO')
+        _edit_hint(L, ctx)
+
+
+class VIBECUT_PT_tools_flat(_ToolsSection, bpy.types.Panel):
+    bl_label = "Flat Region"
+    bl_idname = "VIBECUT_PT_tools_flat"
+    bl_options = {'DEFAULT_CLOSED'}
+    _icon = 'SNAP_FACE'
+
+    def draw(self, ctx):
+        S = ctx.scene
+        L = self.layout
+        c = L.column(align=True)
+        c.enabled = ctx.mode == 'EDIT_MESH'
+        cap = c.column(align=True)
+        cap.scale_y = 0.8
+        cap.label(text="Make a nearly-flat patch truly flat:")
+        cap.label(text="click one face, Select, then Flatten.")
+        c.prop(S, "vibecut_mt_flat_angle")
+        c.prop(S, "vibecut_mt_flatten_boundary")
+        c.prop(S, "vibecut_mt_flatten_influence")
+        col = c.column(align=True)
+        col.scale_y = 1.2
+        col.operator("vibecut.select_flat_region", text="Select Flat Region",
+                     icon='RESTRICT_SELECT_OFF')
+        col.operator("vibecut.flatten_region", text="Flatten Region",
+                     icon='MOD_SMOOTH')
+        _edit_hint(L, ctx)
+
+
+class VIBECUT_PT_quick(bpy.types.Panel):
+    """Edit Mode fixers: select part of the mesh, then click"""
+    bl_label = "Quick Tools"
+    bl_idname = "VIBECUT_PT_quick"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "VibeCut"
+    bl_order = 50
+
+    def draw(self, ctx):
+        p = _props(ctx)
+        S = ctx.scene
+        L = self.layout
+        c = L.column()
+        c.enabled = ctx.mode == 'EDIT_MESH'
+        cap = c.column(align=True)
+        cap.scale_y = 0.8
+        cap.label(text="Select part of the mesh, then click.")
+
+        col = c.column(align=True)
+        col.prop(p, "wall_vertical")
+        col.prop(p, "wall_edges", text="")
+        col.prop(p, "wall_smooth")
+        col.operator("vibecut.tool_straighten_wall", icon='CURVE_PATH')
+
+        col = c.column(align=True)
+        col.prop(S, "vibecut_mt_straighten_count")
+        col.operator("vibecut.straighten_to_line", text="Straighten to Line",
+                     icon='IPO_LINEAR')
+        col.operator("vibecut.straighten_to_axis", text="Straighten to Axis",
+                     icon='EMPTY_AXIS')
+        col.operator("vibecut.smooth_curve_line", text="Curve Line",
+                     icon='IPO_EASE_IN_OUT')
+
+        col = c.column(align=True)
+        col.prop(p, "loop_move", text="Move")
+        col.prop(p, "loop_weld")
+        col.prop(p, "loop_zip")
+        col.operator("vibecut.tool_snap_loop", icon='SNAP_EDGE')
+
+        col = c.column(align=True)
+        col.operator("vibecut.dissolve_line_interior", text="Dissolve Interior",
+                     icon='X')
+        col.operator("vibecut.color_shell_menu", text="Color Piece",
+                     icon='COLOR')
+        _edit_hint(L, ctx)
 
 
 class VIBECUT_PT_more(bpy.types.Panel):
-    """Last panel of the tab: parent of Supports, Knuckle Hinge and Auto
-    Joint Detection (they set bl_parent_id to this). Registered here because
-    tools registers first and a parent must exist before its children."""
+    """Less-used tools, folded away"""
     bl_label = "More..."
     bl_idname = "VIBECUT_PT_more"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "VibeCut"
     bl_options = {'DEFAULT_CLOSED'}
-    bl_order = 100            # after every other panel (they default to 0)
+    bl_order = 100
 
     def draw(self, ctx):
         pass
@@ -1661,7 +1688,11 @@ _classes = (
     VIBECUT_OT_tool_make_round, VIBECUT_OT_tool_fill_round,
     VIBECUT_OT_tool_thin_walls, VIBECUT_OT_tool_straighten_wall,
     VIBECUT_OT_tool_snap_loop,
-    VIBECUT_PT_tools, VIBECUT_PT_more,
+    VIBECUT_PT_tools, VIBECUT_PT_tools_cleanup, VIBECUT_PT_tools_quads,
+    VIBECUT_PT_tools_print, VIBECUT_PT_tools_bevel,
+    VIBECUT_PT_tools_click_collapse, VIBECUT_PT_tools_flat,
+    VIBECUT_PT_quick, VIBECUT_PT_more,
+    VIBECUT_PT_tools_round,
 )
 
 

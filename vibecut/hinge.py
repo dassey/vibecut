@@ -1,22 +1,3 @@
-# VibeCut Knuckle Hinge - replace a FAKE (fused, decorative) hinge on a
-# 2D->3D (AI-generated) model with a real working knuckle hinge.
-#
-# AI image-to-3D models (Hunyuan3D etc.) come out as ONE welded shell: a box
-# lid and its body are fused through a hinge that only looks like a hinge.
-# This module:
-#   1. cuts the fake hinge out with a cylinder (the "guide" the user lines up)
-#   2. splits what is left into BODY and LID
-#   3. adds alternating knuckles (body / lid / body ...) with a leaf that
-#      fuses each knuckle into its own part
-#   4. adds the pin: print-in-place (fused to the body knuckles, lid knuckles
-#      spin on it with clearance) or a separate push-in pin
-#   5. validates: watertight, each part one piece, no part touching the other,
-#      and SWINGS the lid around the axis to report how far it opens/closes
-#
-# Self-contained (no intra-package imports) so tests can load it standalone
-# via importlib, like tools.py and supports.py. Core work = plain functions,
-# operators = thin wrappers. 1 Blender unit = 1 mm (VibeCut convention).
-
 import math
 
 import bpy
@@ -27,31 +8,22 @@ from mathutils.bvhtree import BVHTree
 
 GUIDE_NAME = "VC_HingeGuide"
 
-# (length factor, width factor) tried in order until the lid comes free.
 GROW_STEPS = ((1.0, 1.0), (1.15, 1.0), (1.3, 1.0), (1.3, 1.25), (1.45, 1.25),
               (1.3, 1.5), (1.6, 1.5), (1.6, 2.0))
 
-# Defaults tuned for a Bambu 0.4 mm nozzle in PLA. Radial clearance 0.35 mm
-# sits in the 0.2-0.4 mm range print-in-place hinges use for knuckles of
-# several mm (smaller knuckles need tighter gaps); axial gap 0.4 mm = one
-# line width so neighbouring knuckle faces never weld.
 DEFAULTS = {
-    "knuckle_d": 0.0,      # 0 = auto: fill the cut (cut diameter - 2*clearance)
+    "knuckle_d": 0.0,
     "pin_d": 3.6,
-    "clearance": 0.35,     # radial, per side, lid knuckle bore vs pin
-    "gap": 0.4,            # axial, between neighbouring knuckles
-    "count": 5,            # odd: body knuckles at both ends hold the pin
-    "leaf_reach": 2.5,     # how far each knuckle's leaf digs into its part
-    "pin_mode": 'PIP',     # 'PIP' print-in-place | 'SEPARATE' push-in pin
-    "pin_fit": 0.10,       # SEPARATE: body bore clearance (snug)
-    "swap": False,         # swap which piece is the lid
+    "clearance": 0.35,
+    "gap": 0.4,
+    "count": 5,
+    "leaf_reach": 2.5,
+    "pin_mode": 'PIP',
+    "pin_fit": 0.10,
+    "swap": False,
     "segments": 64,
 }
 
-
-# --------------------------------------------------------------------------
-# Mesh array helpers (numpy; fast on multi-million-vertex AI meshes)
-# --------------------------------------------------------------------------
 
 def _co(me):
     co = np.empty(len(me.vertices) * 3)
@@ -60,7 +32,6 @@ def _co(me):
 
 
 def _components(me):
-    """Vertex island labels 0..k-1 (Shiloach-Vishkin style hooking)."""
     n = len(me.vertices)
     ev = np.empty(len(me.edges) * 2, dtype=np.int64)
     me.edges.foreach_get("vertices", ev)
@@ -93,7 +64,6 @@ def _face_arrays(me):
 
 
 def mesh_subset(me, face_mask, name):
-    """New mesh holding only the faces in face_mask (verts remapped)."""
     ls, lt, lv = _face_arrays(me)
     sls, slt = ls[face_mask], lt[face_mask]
     offs = np.cumsum(slt) - slt
@@ -115,8 +85,6 @@ def mesh_subset(me, face_mask, name):
 
 
 def drop_crumbs(ob, min_frac=0.001):
-    """Delete islands smaller than min_frac of the object's vertices.
-    Returns how many vertices were removed."""
     lab = _components(ob.data)
     cnt = np.bincount(lab)
     keep = cnt >= max(min_frac * cnt.sum(), 1)
@@ -132,12 +100,6 @@ def drop_crumbs(ob, min_frac=0.001):
 
 
 def micro_repair(ob, max_bad=200):
-    """Booleans on multi-million-face AI meshes occasionally leave a handful
-    of bad edges (seen: 1 edge, purely from 0.35 vs float32 0.3499999).
-    LOCAL only (a global weld/dissolve turned 1 bad edge into 5489): delete
-    the faces within 2 rings of each bad edge, then fill the small holes.
-    Only written back if it really ends with fewer bad edges.
-    Returns the bad-edge count after."""
     bm = bmesh.new()
     bm.from_mesh(ob.data)
     bad = [e for e in bm.edges if not e.is_manifold]
@@ -177,10 +139,6 @@ def non_manifold_edges(me):
     return n
 
 
-# --------------------------------------------------------------------------
-# Solids (convex hulls -> always closed, manifold, outward normals)
-# --------------------------------------------------------------------------
-
 def _frame(axis):
     a = Vector(axis).normalized()
     ref = Vector((0, 0, 1)) if abs(a.z) < 0.9 else Vector((1, 0, 0))
@@ -218,7 +176,6 @@ def cylinder_points(c, axis, t0, t1, r, seg):
 
 
 def knuckle_points(c, axis, t0, t1, r, leaf_dir, leaf_len, seg):
-    """Cylinder + tangent leaf toward leaf_dir = a 'D' shaped convex solid."""
     a, _, _ = _frame(axis)
     d = Vector(leaf_dir)
     d = (d - a * d.dot(a)).normalized()
@@ -241,10 +198,6 @@ def _merge_meshes(meshes, name):
         bpy.data.meshes.remove(m)
     return out
 
-
-# --------------------------------------------------------------------------
-# Boolean (Manifold solver: fast + exact on watertight input)
-# --------------------------------------------------------------------------
 
 def _link(ob):
     bpy.context.scene.collection.objects.link(ob)
@@ -278,13 +231,7 @@ def boolean(target, tool_mesh, op):
     return target
 
 
-# --------------------------------------------------------------------------
-# Guide (the wire cylinder the user lines up on the fake hinge)
-# --------------------------------------------------------------------------
-
 def guide_from_object(g):
-    """center, axis (unit), half_length, cut_radius from the guide object.
-    The guide mesh is a unit cylinder (radius 1, z -1..1)."""
     M = g.matrix_world
     c = M.translation.copy()
     ax = M.col[2].xyz
@@ -315,9 +262,6 @@ def make_guide(center, axis, half_len, radius):
 
 
 def guess_guide(ob, cursor):
-    """Axis: horizontal, perpendicular to (cursor - model centre) - the
-    hinge runs along the box edge it sits on. Length 35% of the model
-    across that axis, radius 4% of the model's longest side."""
     M = ob.matrix_world
     pts = [M @ Vector(b) for b in ob.bound_box]
     mn = Vector([min(p[i] for p in pts) for i in range(3)])
@@ -340,16 +284,12 @@ def _kasa(p):
 
 
 def _section(uv, t, tri, ts):
-    """Exact cross-section of the mesh by the plane t = ts, as 2D points
-    (segment ends + midpoints). Works on low- and high-poly meshes alike."""
     d = t[tri] - ts
     s = d > 0
     cross = s.any(1) & ~s.all(1)
     tri, d = tri[cross], d[cross]
     if not len(tri):
         return np.zeros((0, 2))
-    # Each crossing triangle contributes one segment (its 2 crossing edges);
-    # sample along it so a low-poly section still fills every angle bin.
     ends = np.zeros((len(tri), 2, 2))
     filled = np.zeros(len(tri), dtype=np.int64)
     for i, j in ((0, 1), (1, 2), (2, 0)):
@@ -364,9 +304,6 @@ def _section(uv, t, tri, ts):
 
 
 def fit_fake_hinge(ob, center, axis, half_len, radius):
-    """Re-centre the guide on the fake hinge barrel: in thin slices across
-    the axis, take the outermost surface point per 10 deg angle bin near the
-    barrel and least-squares fit a circle. Returns (center, radius, rms)."""
     a, u, v = _frame(axis)
     M = np.array(ob.matrix_world)
     co = _co(ob.data) @ M[:3, :3].T + M[:3, 3]
@@ -378,8 +315,6 @@ def fit_fake_hinge(ob, center, axis, half_len, radius):
     tri = np.empty(len(me.loop_triangles) * 3, dtype=np.int64)
     me.loop_triangles.foreach_get("vertices", tri)
     tri = tri.reshape(-1, 3)
-    # Only triangles reaching into the guide's length (boolean output has
-    # long fan triangles, so don't pre-filter by distance from the axis).
     tri = tri[np.abs(t[tri]).min(1) <= half_len * 1.01]
     cs, rs, errs = [], [], []
     for frac in (-0.4, -0.2, 0.0, 0.2, 0.4):
@@ -413,10 +348,6 @@ def fit_fake_hinge(ob, center, axis, half_len, radius):
     return new_center, float(np.median(rs)), float(np.median(errs))
 
 
-# --------------------------------------------------------------------------
-# Swing test: rotate the lid about the axis, find where it hits the body
-# --------------------------------------------------------------------------
-
 def _rotate(P, c, a, ang):
     a = np.array(a) / np.linalg.norm(a)
     p = P - c
@@ -426,9 +357,6 @@ def _rotate(P, c, a, ang):
 
 
 def _surface_samples(me, P, c, a, near_r, samples, seed):
-    """Area-weighted random points ON the surface (not just vertices, so a
-    low-poly lid is sampled across its faces too): half from triangles near
-    the hinge axis, half from the rest."""
     me.calc_loop_triangles()
     tri = np.empty(len(me.loop_triangles) * 3, dtype=np.int64)
     me.loop_triangles.foreach_get("vertices", tri)
@@ -455,8 +383,6 @@ def _surface_samples(me, P, c, a, near_r, samples, seed):
 
 def swing_test(body, lid, center, axis, hinge_r, step_deg=3.0, max_deg=180,
                samples=6000, depth=0.15, seed=1):
-    """Degrees the lid can rotate each way before any sampled lid point is
-    more than `depth` mm inside the body. Samples favour the hinge zone."""
     dg = bpy.context.evaluated_depsgraph_get()
     bvh = BVHTree.FromObject(body, dg)
     P = _co(lid.data)
@@ -469,9 +395,6 @@ def swing_test(body, lid, center, axis, hinge_r, step_deg=3.0, max_deg=180,
             Vector((-0.577, -0.408, 0.707)).normalized())
 
     def inside(p):
-        # Cheap reject first, then two rays: first hit must be a back face
-        # (we're leaving the solid) for BOTH. Robust on closed meshes where
-        # a lone nearest-face normal test misfires at sharp corners.
         loc, nor, _, dist = bvh.find_nearest(p)
         if loc is None or dist <= depth or (p - loc).dot(nor) >= 0:
             return False
@@ -501,7 +424,6 @@ def swing_test(body, lid, center, axis, hinge_r, step_deg=3.0, max_deg=180,
             free = ang
             ang += step_deg
         out[sign] = free
-    # Closing = the direction that brings the lid's centre toward the body.
     lc = P.mean(0)
     d_plus = np.linalg.norm(_rotate(lc[None], c, a, math.radians(5))[0] - body_c)
     d_minus = np.linalg.norm(_rotate(lc[None], c, a, math.radians(-5))[0] - body_c)
@@ -511,22 +433,11 @@ def swing_test(body, lid, center, axis, hinge_r, step_deg=3.0, max_deg=180,
     return out
 
 
-# --------------------------------------------------------------------------
-# Closed-pose fit: where must the hinge axis be so the lid SEATS on the body?
-# AI models put the fake hinge where it looks right, not where the lid's rim
-# actually lands on the body's rim (e.g. the front hits a neck collar at 38 deg,
-# the sides need 50, and the back floats 5 mm at every angle).
-# --------------------------------------------------------------------------
-
 _RAYS = (Vector((0.267, 0.534, 0.802)).normalized(),
          Vector((-0.577, -0.408, 0.707)).normalized())
 
 
 def _signed_dist(bvh, Q, max_d, near=5.0):
-    """Distance to the body surface, negative = inside the body. Within
-    `near` mm the sign comes from two rays (first hit must be a BACK face
-    for both) - the nearest-face normal alone flips inside thin walls (a
-    point 1.5 mm into a 2 mm wall 'sees' the far face) and far away."""
     out = np.empty(len(Q))
     for i, p in enumerate(Q):
         v = Vector(p)
@@ -543,8 +454,6 @@ def _signed_dist(bvh, Q, max_d, near=5.0):
             if hit is None or hn.dot(r) <= 0:
                 inside = False
                 break
-        # Flush contact (coplanar faces) is a SEAT, not a dig: <= 0.15 mm
-        # inside counts as touching.
         out[i] = (-d if d > 0.15 else 0.0) if inside else d
     return out
 
@@ -575,9 +484,6 @@ def _close_sign(body, lid, c, a):
 
 
 def rim_stats(bvh, rim, c, a, ang_deg, bins=18):
-    """Per-direction seat of the lid rim at a closing angle: list of
-    (bin_deg, min signed distance mm, fraction of the bin inside the body).
-    >0 = gap, <0 = digs into the body."""
     R = _rotate(rim, c, a, math.radians(ang_deg))
     s = _signed_dist(bvh, R, 30.0)
     cen = R.mean(0)
@@ -592,17 +498,11 @@ def rim_stats(bvh, rim, c, a, ang_deg, bins=18):
 
 
 def rim_report(bvh, rim, c, a, ang_deg, bins=18):
-    """(bin_deg, min signed distance mm) - see rim_stats."""
     return [(b, m) for b, m, _ in rim_stats(bvh, rim, c, a, ang_deg, bins)]
 
 
 def fit_closed_pose(body, lid, center, axis, exclude_r, samples=24000,
                     rim_n=2000, seed=3, orig_ob=None, reach_r=3.0):
-    """Search hinge-axis position (in the plane across the axis) and closing
-    angle so the lid rim touches the body rim all the way round, keeping the
-    axis within reach_r of orig_ob's material (the fused model). Returns a
-    dict: center, angle (signed deg, about axis), rows, max_gap, max_dig,
-    moved_mm - or None if the lid never comes near the body."""
     dg = bpy.context.evaluated_depsgraph_get()
     bvh = BVHTree.FromObject(body, dg)
     c0 = np.array(center)
@@ -613,16 +513,13 @@ def fit_closed_pose(body, lid, center, axis, exclude_r, samples=24000,
     S = _area_samples(lid.data, samples, seed)
     rel = S - c0
     rad = np.linalg.norm(rel - np.outer(rel @ a, a), axis=1)
-    S = S[rad > exclude_r]                       # ignore the hinge zone
+    S = S[rad > exclude_r]
     rng = np.random.default_rng(seed)
     probe = S[rng.choice(len(S), min(3000, len(S)), replace=False)]
-    # First contact about the guide axis.
     th0 = None
     for d in range(2, 121, 2):
         sd = _signed_dist(bvh, _rotate(probe, c0, a, math.radians(sgn * d)),
                           30.0)
-        # Real first contact is SHALLOW; the fast nearest-normal sign test
-        # misreads a few far points as -26..-30 mm deep, so ignore those.
         if ((sd < -0.3) & (sd > -8.0)).sum() >= max(5, len(probe) // 500):
             th0 = d
             break
@@ -634,9 +531,6 @@ def fit_closed_pose(body, lid, center, axis, exclude_r, samples=24000,
         return None
     rim = rim[rng.choice(len(rim), min(rim_n, len(rim)), replace=False)]
 
-    # The axis must stay where knuckles can live: within reach of the
-    # ORIGINAL model's material (a flat lid could otherwise "seat" just as
-    # well slid 20 mm sideways, with the hinge floating in air).
     orig_bvh = None
     if orig_ob is not None:
         orig_bvh = BVHTree.FromObject(orig_ob, dg)
@@ -657,10 +551,6 @@ def fit_closed_pose(body, lid, center, axis, exclude_r, samples=24000,
     def cost(du, dv, d):
         cc = c0 + u * du + v * dv
         rows = rim_stats(bvh, rim, cc, a, sgn * d)
-        # gap^2 per direction; digging in costs depth^2 PLUS how much of the
-        # rim is buried (depth reads small inside thin walls).
-        # Gap is capped at 2 mm: directions where the lid hovers over a
-        # hollow (never touches at ANY pose) must not steer the fit.
         return (sum((min(m, 2.0) ** 2 if m > 0 else m * m + 20.0 * f)
                     for _, m, f in rows)
                 + 0.05 * (du * du + dv * dv)
@@ -698,9 +588,6 @@ def fit_closed_pose(body, lid, center, axis, exclude_r, samples=24000,
 
 
 def trim_for_closing(body, lid, center, axis, angle_deg, clearance):
-    """Remove body material the CLOSED lid would sit in (+ clearance), so
-    the lid can shut: lid copy rotated closed, nudged +/- clearance along
-    x/y/z, each subtracted from the body."""
     M = (Matrix.Translation(center) @ Matrix.Rotation(math.radians(angle_deg),
                                                       4, Vector(axis))
          @ Matrix.Translation(-Vector(center)))
@@ -715,7 +602,6 @@ def trim_for_closing(body, lid, center, axis, angle_deg, clearance):
 
 
 def keep_largest(ob):
-    """Keep only the biggest island; returns vertices dropped."""
     lab = _components(ob.data)
     cnt = np.bincount(lab)
     if len(cnt) < 2:
@@ -731,10 +617,6 @@ def keep_largest(ob):
 
 def fill_seam(body, lid, center, axis, angle_deg, depth=4.0, step=0.5,
               clearance=0.35):
-    """Raise a wavy body rim to meet the CLOSED lid (e.g. a rim that sags
-    2.8 mm mid-side leaves a 2.5 mm slit when shut). Filler = (body swept UP by
-    depth) AND (closed lid swept DOWN by depth): only the band where the two
-    nearly meet. Unioned into the body; caller re-trims clearance."""
     M = (Matrix.Translation(center) @ Matrix.Rotation(math.radians(angle_deg),
                                                       4, Vector(axis))
          @ Matrix.Translation(-Vector(center)))
@@ -754,16 +636,11 @@ def fill_seam(body, lid, center, axis, angle_deg, depth=4.0, step=0.5,
     down = swept(lid.data, M, -1.0)
     boolean(up, down.data.copy(), 'INTERSECT')
     _remove_with_mesh(down)
-    # Near the hinge the OPEN and shut lid overlap, so carve the lid's whole
-    # swing (shut .. modelled open, 5-deg poses, +/-0.5 deg) out of the
-    # filler - otherwise it fills where the lid has to pass.
     nst = max(2, int(math.ceil(abs(angle_deg) / 5.0)))
     cl = clearance
     nudges = ((0, 0, 0), (cl, 0, 0), (-cl, 0, 0), (0, cl, 0), (0, -cl, 0),
               (0, 0, cl), (0, 0, -cl))
     for i in range(nst + 1):
-        # The modelled-open pose (i == 0) is how it PRINTS: carve it with
-        # clearance nudges, or the filler ends flush against the lid (fused).
         poses = ([(0.0, n) for n in nudges] if i == 0 else
                  [(angle_deg * i / nst + off, (0, 0, 0))
                   for off in (-0.5, 0.0, 0.5)])
@@ -782,15 +659,11 @@ def fill_seam(body, lid, center, axis, angle_deg, depth=4.0, step=0.5,
     bpy.data.objects.remove(up)
     if nv:
         boolean(body, filler, 'UNION')
-        keep_largest(body)    # filler bits that don't touch the body
+        keep_largest(body)
     else:
         bpy.data.meshes.remove(filler)
     return nv
 
-
-# --------------------------------------------------------------------------
-# The whole job
-# --------------------------------------------------------------------------
 
 def _part_dir(co, c, a, r_in, r_out, half):
     rel = co - c
@@ -806,15 +679,10 @@ def _part_dir(co, c, a, r_in, r_out, half):
 
 
 def _wedge_meshes(c, a, t0, t1, r, leaf_dir, deg_range, half_w, seg):
-    """Volume a leaf (direction leaf_dir, half width half_w, length r)
-    sweeps when rotated through deg_range about the axis, as convex hull
-    pieces of <= 90 deg each (so every piece stays convex)."""
     a_, u, v = _frame(a)
     d = Vector(leaf_dir)
     base = math.atan2(d.dot(v), d.dot(u))
     pad = math.asin(min(1.0, half_w / max(r, 1e-6))) + math.radians(1)
-    # Rotating by +phi about a turns the (u,v) angle by +phi or -phi
-    # depending on frame handedness - measure it instead of assuming.
     test = _rotate(np.array([np.array(u)]), np.zeros(3), np.array(a_),
                    math.radians(10))[0]
     hand = 1.0 if Vector(test).dot(v) > 0 else -1.0
@@ -828,7 +696,7 @@ def _wedge_meshes(c, a, t0, t1, r, leaf_dir, deg_range, half_w, seg):
         b0 = a0 + (a1 - a0) * i / nseg
         b1 = a0 + (a1 - a0) * (i + 1) / nseg
         steps = max(2, int(seg * (b1 - b0) / (2 * math.pi)) + 2)
-        rr = r / math.cos((b1 - b0) / (2 * steps))   # chords stay outside r
+        rr = r / math.cos((b1 - b0) / (2 * steps))
         pts = []
         for t in (t0, t1):
             pts.append(c + a_ * t)
@@ -842,8 +710,6 @@ def _wedge_meshes(c, a, t0, t1, r, leaf_dir, deg_range, half_w, seg):
 
 def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
                         run_swing=True):
-    """Returns (log lines, result dict). Raises nothing for user errors:
-    result['ok'] False + a plain-English reason in the log."""
     o = dict(DEFAULTS)
     o.update(opts or {})
     log = []
@@ -868,10 +734,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
                    "Hinge sizes are real mm: scale to print size FIRST "
                    "(Tools > Scale to Size)." % max(dims))
 
-    # 1+2. Cut the fake hinge out and split. AI models often weld the lid
-    # to the body a little past the visible hinge (end tabs, touching rims),
-    # so if the lid is still attached, grow the cut - longer first (keeps
-    # the knuckles slim), then wider - until it comes free.
     base_me = ob.data.copy()
     base_me.transform(ob.matrix_world)
     grow = o.get("grow", GROW_STEPS)
@@ -908,8 +770,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
     L = 2 * half_len
     log.append("cut fake hinge: %.1f mm long, %.2f mm diameter"
                % (L, 2 * cut_r))
-    # Knuckle stack is inset one gap from each end of the cut, so no knuckle
-    # ends flush against leftover material of the OTHER part past the cut.
     hs = half_len - gap
     seg_len = (2 * hs - (n - 1) * gap) / n
     if seg_len < 2.0:
@@ -931,7 +791,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
     if dropped:
         log.append("removed %d stray vertices (floating crumbs)" % dropped)
 
-    # 3. Body = the piece that reaches lowest (sits on the bed).
     zmin = [_co(p.data)[:, 2].min() for p in pieces]
     body, lid = (pieces if zmin[0] <= zmin[1] else pieces[::-1])
     if o["swap"]:
@@ -946,9 +805,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
         p.name = ob.name + nm
         p.data.name = ob.name + nm
 
-    # 3b. Where does the lid really close? Fit the hinge axis + closing
-    # angle so the lid rim seats on the body rim, then cut the body wherever
-    # the closed lid would sit inside it (e.g. a neck collar it lands on).
     c_sep = c.copy()
     close_ang = None
     if o.get("auto_fit", True):
@@ -973,7 +829,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
                           max(fit["max_dig"], 0)))
     moved = (c - c_sep).length
     if moved > 1e-3:
-        # Clear the knuckle zone around the NEW axis in both parts.
         for p in (body, lid):
             boolean(p, _hull_mesh(cylinder_points(c, a, -half_len, half_len,
                                                   rk + clr, seg), "_vc_zone"),
@@ -990,19 +845,14 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
         trim_for_closing(body, lid, c, a, close_ang, clr)
         log.append("trimmed the body where the closed lid sits (+%.2f mm "
                    "clearance)" % clr)
-        # The clearance trim can sever thin filler strips from the rim;
-        # loose strips would float / touch the lid. Body is ONE piece here.
         lost = keep_largest(body)
         if lost:
             log.append("dropped %d verts of seam filler cut loose by the "
                        "trim" % lost)
 
-    # 4. Which way each part lies from the axis (leaf direction).
     cn, an = np.array(c), np.array(a)
     dirs = {}
     for p, key in ((body, "body"), (lid, "lid")):
-        # 0.98: include the verts the cut itself left on the part (the only
-        # ones near the axis on a low-poly model).
         d, cntp = _part_dir(_co(p.data), cn, an, inner * 0.98,
                             reach + 3 * rk, half_len)
         if d is None:
@@ -1017,13 +867,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
         log.append("WARNING: body and lid sit almost the same side of the "
                    "axis - leaves may touch the wrong part.")
 
-    # 5. Knuckles = round barrel + a leaf that ties it into its own part.
-    # Axis on the fake hinge (normal case): BOX leaves toward the part, cut
-    # to the ORIGINAL model's shape (TRIM) so nothing pokes past the old
-    # silhouette; full box if a trimmed leaf ends up floating.
-    # Axis MOVED by the lid fit (it often lands outside the shell, behind
-    # the rim): BRIDGE leaves = convex hull of the barrel + the nearest patch
-    # of the part's own surface, i.e. a bracket out to the hinge.
     bridge = moved > 1.5
     spans = []
     for i in range(n):
@@ -1033,10 +876,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
     part_co = {k: _co(v.data) for k, v in part_of.items()}
     leaf_len = reach + o["leaf_reach"]
 
-    # Bridge struts: ONE length per part (the longest reach any of its
-    # knuckles needs), so every bracket of a part is identical. A per-knuckle
-    # hull of "nearest shell patch" made one bracket visibly bigger than the
-    # other on the asymmetric AI shell.
     strut_len = {}
     if bridge:
         dg_s = bpy.context.evaluated_depsgraph_get()
@@ -1083,10 +922,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
         bpy.data.objects.remove(tmp)
         return out
 
-    # Mortise relief: clear the OTHER part wherever a knuckle travels.
-    # Known closing angle: the exact swept path, closed (-3 deg) .. 30 deg
-    # past the modelled open pose, as hulls of consecutive 6-deg poses of the
-    # (clearance-inflated) knuckle. Unknown: a full ring per knuckle.
     if o.get("relief", True):
         if close_ang is not None:
             far_open = -math.copysign(30.0, close_ang)
@@ -1111,7 +946,7 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
                 tt = rel @ an
                 radv = rel - np.outer(tt, an)
                 rr = np.linalg.norm(radv, axis=1, keepdims=True)
-                P = P + radv / np.maximum(rr, 1e-9) * clr     # radial clearance
+                P = P + radv / np.maximum(rr, 1e-9) * clr
                 sweep = None
                 for a0, a1 in zip(angs[:-1], angs[1:]):
                     Q = np.r_[_rotate(P, cn, an, math.radians(sgn_rel * a0)),
@@ -1151,7 +986,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
         log.append("hinge sits off the shell: knuckles bridged to each part")
     bpy.data.meshes.remove(base_me)
 
-    # 6. Pin.
     pin = None
     bore = rp + clr
     if o["pin_mode"] == 'PIP':
@@ -1160,7 +994,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
         log.append("pin %.2f mm fused to the body knuckles (print-in-place)"
                    % (2 * rp))
     else:
-        # Drill the body bore out past the ends so the pin can be pushed in.
         drill = half_len + 3 * cut_r
         boolean(body, _hull_mesh(cylinder_points(
             c, a, -drill, drill, rp + o["pin_fit"], seg),
@@ -1179,7 +1012,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
     log.append("%d knuckles %.2f mm wide, OD %.2f mm, %.2f mm radial / "
                "%.2f mm axial clearance" % (n, seg_len, 2 * rk, clr, gap))
 
-    # 7. Validate (after sweeping boolean crumbs - slivers of a few verts).
     ok = True
     crumbs = sum(drop_crumbs(p) for p in (body, lid))
     if crumbs:
@@ -1232,8 +1064,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
         if sw["at_0_collides"] or sw["close_deg"] < 3:
             ok = False
             log.append("WARNING: the lid can't swing - check the guide axis.")
-        # Does it actually SHUT? (A free swing that stops short is a
-        # failure mode: 'OK' at 36 deg while the lid needs ~41.)
         if close_ang is not None:
             need = abs(close_ang)
             fine = swing_test(body, lid, c, a, cut_r, step_deg=1.0,
@@ -1242,8 +1072,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
             dg2 = bpy.context.evaluated_depsgraph_get()
             rows = rim_report(BVHTree.FromObject(body, dg2), fit["rim"],
                               np.array(c), np.array(a), close_ang)
-            # 80th percentile over directions: one direction where the lid
-            # hangs over the hollow interior must not read as "gaps 8 mm".
             gaps = sorted(max(m, 0.0) for _, m in rows)
             worst_gap = gaps[min(len(gaps) - 1, int(0.8 * len(gaps)))]
             res["seat_gap"] = worst_gap
@@ -1275,7 +1103,6 @@ def build_knuckle_hinge(ob, center, axis, half_len, cut_r, opts=None,
 
 
 def export_stls(objs, folder, stem):
-    """One STL per object plus an all-in-one STL (print-in-place)."""
     import os
     os.makedirs(folder, exist_ok=True)
     paths = []
@@ -1297,10 +1124,6 @@ def export_stls(objs, folder, stem):
         _export([x], os.path.join(folder, x.name + ".stl"))
     return paths
 
-
-# --------------------------------------------------------------------------
-# UI
-# --------------------------------------------------------------------------
 
 def _poll_source(self, ob):
     return ob.type == 'MESH' and ob.name != GUIDE_NAME
@@ -1491,6 +1314,7 @@ class VIBECUT_PT_hinge(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "VibeCut"
     bl_parent_id = "VIBECUT_PT_more"
+    bl_order = 1
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, ctx):

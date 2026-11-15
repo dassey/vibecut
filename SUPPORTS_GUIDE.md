@@ -68,7 +68,7 @@ bulletproof and lets the slicer trim them).
 ## Daily use (three clicks)
 
 1. Click your model. Open the N-panel (press **N**) → **VibeCut** tab →
-   **Supports**.
+   **More...** → **Supports**.
 2. Pick your **Printer** and **Material** at the top (defaults: X1
    Carbon, PLA). Leave **Support Style** on Twist-off Pins.
 3. Click **Generate Supports**.
@@ -114,7 +114,7 @@ Notes:
 Bonus: if your AMS has Bambu Support for PLA loaded, you can assign that
 filament to just the supports part for glass-smooth undersides.
 
-## The other new tools (Mesh Cleanup panel)
+## The other new tools (Tools panel: Auto Bevel and Flat Region sections)
 
 **Auto Bevel** — rounds off sharp edges so they print stronger and look
 cleaner. In Object Mode, click **Auto Bevel (Modifier)**: every edge

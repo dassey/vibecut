@@ -1,18 +1,3 @@
-"""
-auto_detect.py — UI wrapper for the existing detection.py pipeline.
-
-`detection.py` already implements voxel + SDF based neck-finding. This module
-exposes it via a panel + operators so it can be run from the UI.
-
-For each detected neck, an Empty object is placed at the world position with
-'CIRCLE' display type sized to the neck radius. The Empty's name encodes its
-score. The user can then use existing VibeCut tools (Ring Cutter) to cut at
-the candidate locations.
-
-Empties are collected in 'VibeCut Candidates' (a dedicated scene collection)
-so they can be wiped in one shot.
-"""
-
 import bpy
 from mathutils import Vector
 
@@ -22,10 +7,6 @@ from . import detection
 CANDIDATE_COLL_NAME = "VibeCut Candidates"
 VG_PREFIX = "VC_limb_"
 
-
-# ══════════════════════════════════════════════════
-#  Helpers
-# ══════════════════════════════════════════════════
 
 def _get_or_create_collection(scene, name):
     coll = bpy.data.collections.get(name)
@@ -45,10 +26,6 @@ def _wipe_collection(name):
     bpy.data.collections.remove(coll)
     return n
 
-
-# ══════════════════════════════════════════════════
-#  Operators
-# ══════════════════════════════════════════════════
 
 class VIBECUT_OT_detect_joints(bpy.types.Operator):
     """Run the voxel + SDF neck-detection pipeline on the active mesh.
@@ -87,11 +64,9 @@ class VIBECUT_OT_detect_joints(bpy.types.Operator):
                         "No neck candidates found. Try lowering Sensitivity.")
             return {'CANCELLED'}
 
-        # Wipe any previous run
         _wipe_collection(CANDIDATE_COLL_NAME)
         coll = _get_or_create_collection(scene, CANDIDATE_COLL_NAME)
 
-        # Drop vertex groups left by a previous detection run.
         for vg in [g for g in obj.vertex_groups if g.name.startswith(VG_PREFIX)]:
             obj.vertex_groups.remove(vg)
 
@@ -108,24 +83,16 @@ class VIBECUT_OT_detect_joints(bpy.types.Operator):
             empty.empty_display_type = 'CIRCLE'
             empty.empty_display_size = max(0.001, radius)
             empty.location = pos
-            # Rotate so the circle's normal matches the neck normal
             up = Vector((0.0, 0.0, 1.0))
             quat = up.rotation_difference(normal.normalized())
             empty.rotation_mode = 'QUATERNION'
             empty.rotation_quaternion = quat
-            # Stash score + radius as custom props so Cut at Candidate can read them
             empty["vibecut_score"] = float(score)
             empty["vibecut_radius"] = float(radius)
             empty["vibecut_normal"] = (normal.x, normal.y, normal.z)
             empty["vibecut_source"] = obj.name
-            # Vertex count at detection time — the stored indices are only
-            # meaningful against this exact topology.
             empty["vibecut_vcount"] = len(obj.data.vertices)
 
-            # Mirror limb membership into a VERTEX GROUP. This is mandatory,
-            # not an optimisation: a module-level cache is wiped by the addon's
-            # own hot-reload and by loading a .blend, while these Empties
-            # persist in the saved file. The vertex group is the durable record.
             if limb:
                 vg = obj.vertex_groups.new(name=VG_PREFIX + name)
                 vg.add(list(limb), 1.0, 'REPLACE')
@@ -149,7 +116,6 @@ class VIBECUT_OT_detect_joints(bpy.types.Operator):
 
 
 def _active_candidate(ctx):
-    """The candidate Empty the user has selected, or None."""
     coll = bpy.data.collections.get(CANDIDATE_COLL_NAME)
     if coll is None:
         return None
@@ -189,8 +155,6 @@ class VIBECUT_OT_cut_at_candidate(bpy.types.Operator):
                         f"Source mesh '{src_name}' is gone. Re-run detection.")
             return {'CANCELLED'}
 
-        # The stored indices only mean anything against the topology that was
-        # present when they were recorded.
         vcount = empty.get("vibecut_vcount", -1)
         if vcount != len(obj.data.vertices):
             self.report({'ERROR'},
@@ -244,7 +208,6 @@ class VIBECUT_OT_cut_at_candidate(bpy.types.Operator):
                 self.report({'WARNING'}, f"Cut OK, press-fit failed: {e}")
                 print(f"[VibeCut] press-fit after contour cut failed: {e}")
 
-        # This candidate's geometry no longer exists; drop it and its group.
         try:
             if vg.name in [g.name for g in obj.vertex_groups]:
                 obj.vertex_groups.remove(vg)
@@ -274,17 +237,14 @@ class VIBECUT_OT_clear_candidates(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# ══════════════════════════════════════════════════
-#  Panel
-# ══════════════════════════════════════════════════
-
 class VIBECUT_PT_auto_detect(bpy.types.Panel):
     bl_label       = "Auto Joint Detection"
     bl_idname      = "VIBECUT_PT_auto_detect"
     bl_space_type  = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category    = "VibeCut"
-    bl_parent_id = "VIBECUT_PT_more"
+    bl_parent_id   = "VIBECUT_PT_more"
+    bl_order       = 3
     bl_options     = {'DEFAULT_CLOSED'}
 
     def draw(self, ctx):
@@ -343,10 +303,6 @@ class VIBECUT_PT_auto_detect(bpy.types.Panel):
         col.label(text="  3. Click Cut Limb Off")
         col.label(text="  (or use the Ring Cutter by hand)")
 
-
-# ══════════════════════════════════════════════════
-#  Registration
-# ══════════════════════════════════════════════════
 
 classes = (
     VIBECUT_OT_detect_joints,

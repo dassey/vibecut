@@ -1,38 +1,3 @@
-"""Automatic limb / neck detection for joint placement.
-
-Method: morphological EROSION SPLITTING on a voxelization of the mesh.
-
-1.  Voxelize the evaluated mesh into an NxNxN boolean grid. Primary path
-    is pure numpy (bin vertices + triangle midpoints into a surface shell,
-    flood the OUTSIDE from the grid border, solid = not outside) - cost
-    scales with the voxel grid, not the vertex count, so a 1.4M-triangle
-    scan voxelizes in about the same time as a 10k one. Low-poly meshes
-    (where big triangles would leak the shell) automatically fall back to
-    BVH column marching with signed-crossing counts.
-2.  Interior distance transform via vectorized 6-neighbour dilation.
-3.  Erode progressively: threshold the distance field at d = 1, 2, 3...
-    When a connected component SPLITS into two, the part that broke off is
-    a limb and the break point is its neck:
-      - neck position  = midpoint of the closest voxel pair between parts
-      - neck radius    = the erosion depth at the split (in mm)
-      - cut direction  = the axis between the two part centroids
-      - score          = 1 - d_split / d_limb_interior  (how much fatter
-                         the limb is than its neck; 0 = no pinch at all)
-    This finds pinch points regardless of absolute size - thin arms and
-    fat legs alike - with no reliance on vertex normals, manifoldness, or
-    "thick cluster" heuristics.
-
-Known limitation (documented, by design): a perfectly cylindrical limb
-joining a fat body with NO pinch at all never separates under erosion and
-is not reported. Organic figures pinch at real joints, which is exactly
-where you want to cut.
-
-Public API (used by auto_detect.py):
-    detect_necks_blender(mesh_obj, resolution=96, sensitivity=0.3)
-        -> list of dicts: world_pos (Vector), world_normal (Vector),
-           radius_world (float), score (float), limb_vert_indices (set)
-"""
-
 import time
 from collections import deque
 
@@ -42,12 +7,7 @@ import bpy
 from mathutils import Vector
 
 
-# ---------------------------------------------------------------------------
-# Mesh extraction
-# ---------------------------------------------------------------------------
-
 def _world_mesh_arrays(mesh_obj):
-    """Evaluated mesh -> (verts (V,3) float64 world, tris (T,3) int32)."""
     dg = bpy.context.evaluated_depsgraph_get()
     ob_eval = mesh_obj.evaluated_get(dg)
     me = ob_eval.to_mesh()
@@ -70,12 +30,7 @@ def _world_mesh_arrays(mesh_obj):
     return verts, tris
 
 
-# ---------------------------------------------------------------------------
-# Voxelization
-# ---------------------------------------------------------------------------
-
 def _dilate6(m):
-    """6-connected binary dilation without wraparound."""
     out = m.copy()
     out[1:, :, :] |= m[:-1, :, :]
     out[:-1, :, :] |= m[1:, :, :]
@@ -95,9 +50,6 @@ def _bin_points(pts, origin, voxel_size, shape, shell):
 
 
 def _voxelize_shell_flood(verts, tris, resolution, padding=2):
-    """Numpy voxelization: surface shell from binned mesh samples, then
-    flood the outside from the border. Returns (solid, origin, voxel_size)
-    or None if the shell leaked (outside flood ate nearly everything)."""
     bb_min = verts.min(axis=0)
     bb_max = verts.max(axis=0)
     extent = float((bb_max - bb_min).max())
@@ -114,16 +66,10 @@ def _voxelize_shell_flood(verts, tris, resolution, padding=2):
         v0 = verts[tris[:, 0]]
         v1 = verts[tris[:, 1]]
         v2 = verts[tris[:, 2]]
-        # Centroid + edge midpoints seal faces whose verts span voxels.
         for pts in ((v0 + v1 + v2) / 3.0, (v0 + v1) / 2.0,
                     (v1 + v2) / 2.0, (v0 + v2) / 2.0):
             _bin_points(pts, origin, voxel_size, shape, shell)
 
-    # Morphological closing: printable figurine STLs are often HOLLOW
-    # shells with drainage openings. Dilating the shell seals openings up
-    # to ~4 voxels before the outside flood, then the outside grows back
-    # to the true surface (constrained by the real shell). Interior
-    # cavities end up solid - which is what limb-thickness analysis wants.
     close_k = 2
     shell_closed = shell
     for _ in range(close_k):
@@ -144,21 +90,17 @@ def _voxelize_shell_flood(verts, tris, resolution, padding=2):
             break
         outside = grown
 
-    # Grow the conservative outside back to the true surface.
     for _ in range(close_k):
         outside = (_dilate6(outside) & ~shell) | outside
 
     solid = ~outside
     interior = solid & ~shell
-    # Leak check: a sealed object encloses real volume beyond its shell.
     if interior.sum() < max(64, 0.002 * solid.size):
         return None
     return solid, origin, voxel_size
 
 
 def _voxelize_bvh_columns(mesh_obj, resolution, padding=2):
-    """Fallback voxelizer: BVH ray marching per (x, y) column with signed
-    crossing counts (robust to coincident faces and doubled shells)."""
     import bmesh
     from mathutils.bvhtree import BVHTree
 
@@ -216,7 +158,6 @@ def _voxelize_bvh_columns(mesh_obj, resolution, padding=2):
                     solid[ix, iy, ia:ib] = True
     if not solid.any():
         return None
-    # Fill enclosed cavities (hollow shells) so walls read as full limbs.
     free = ~solid
     outside = np.zeros_like(solid)
     outside[0, :, :] = free[0, :, :]
@@ -235,25 +176,11 @@ def _voxelize_bvh_columns(mesh_obj, resolution, padding=2):
     return solid, origin, voxel_size
 
 
-# ---------------------------------------------------------------------------
-# Distance transform (vectorized BFS layers)
-# ---------------------------------------------------------------------------
-
 def distance_transform(solid):
-    """Near-Euclidean interior distance via a Borgefors 3-4-5 chamfer
-    (weights 3 / 4 / 5 for face / edge / corner steps, result divided by
-    3). A plain 6-connected layer count overestimates diagonal distances
-    by up to 73%, which inflates necks relative to limbs and crushes
-    split scores; the chamfer stays within ~8% of true Euclidean.
-
-    Iterative relaxation with whole-array shifted minimums - converges in
-    about max_thickness sweeps, all numpy. Empty voxels = 0; surface
-    voxels ~= 1."""
     solid = np.asarray(solid, dtype=bool)
     full = np.zeros(solid.shape, dtype=np.float32)
     if not solid.any():
         return full
-    # Crop to the solid's bounding box (plus 1) for speed.
     idx = np.argwhere(solid)
     lo = np.maximum(idx.min(axis=0) - 1, 0)
     hi = np.minimum(idx.max(axis=0) + 2, solid.shape)
@@ -300,17 +227,10 @@ def distance_transform(solid):
     return full
 
 
-# ---------------------------------------------------------------------------
-# Connected-component labeling (bbox-cropped, dilation BFS)
-# ---------------------------------------------------------------------------
-
 def _components(mask):
-    """Split a boolean mask into 6-connected components. Returns a list of
-    boolean masks (same shape), largest first."""
     comps = []
     rem = mask.copy()
     while rem.any():
-        # Crop to the remaining bbox for speed.
         idx = np.argwhere(rem)
         lo = idx.min(axis=0)
         hi = idx.max(axis=0) + 1
@@ -333,8 +253,6 @@ def _components(mask):
 
 
 def _closest_pair_midpoint(mask_a, mask_b, max_samples=1500):
-    """Approximate closest voxel pair between two masks -> midpoint (voxel
-    coords, float) and the pair distance."""
     a = np.argwhere(mask_a).astype(np.float64)
     b = np.argwhere(mask_b).astype(np.float64)
     rng = np.random.default_rng(7)
@@ -342,7 +260,6 @@ def _closest_pair_midpoint(mask_a, mask_b, max_samples=1500):
         a = a[rng.choice(len(a), max_samples, replace=False)]
     if len(b) > max_samples:
         b = b[rng.choice(len(b), max_samples, replace=False)]
-    # Chunked broadcast to bound memory.
     best = (np.inf, None, None)
     chunk = 256
     for i in range(0, len(a), chunk):
@@ -356,25 +273,13 @@ def _closest_pair_midpoint(mask_a, mask_b, max_samples=1500):
     return (best[1] + best[2]) / 2.0, float(np.sqrt(best[0]))
 
 
-# ---------------------------------------------------------------------------
-# Erosion splitting
-# ---------------------------------------------------------------------------
-
 def find_neck_events(dist, min_child_vox=30, max_events=64):
-    """Walk the erosion hierarchy of the distance field and record every
-    component split.
-
-    Returns a list of dicts in voxel space:
-        pos (3,) float, radius_vox float, direction (3,) float,
-        score float, child_size int, depth int
-    """
     events = []
     d_global_max = int(np.ceil(dist.max()))
     if d_global_max < 2:
         return events
 
     def recurse(mask, d):
-        # Erode this component until it splits or dies.
         while True:
             d += 1
             sub = mask & (dist >= d)
@@ -409,16 +314,9 @@ def find_neck_events(dist, min_child_vox=30, max_events=64):
                         "score": float(np.clip(score, 0.0, 1.0)),
                         "child_size": int(child.sum()),
                         "depth": d,
-                        # Flat voxel indices of the limb core. `child` is
-                        # captured mid-erosion at depth d, so it excludes the
-                        # limb's own surface shell — the caller regrows it.
-                        # Stored as flat indices (proportional to limb size)
-                        # rather than a full resolution^3 grid per event, which
-                        # would cost ~900 KB each at resolution 96.
                         "child_idx": np.flatnonzero(child.ravel()),
                         "grid_shape": child.shape,
                     })
-            # Recurse into every surviving piece.
             for c in comps:
                 if c.sum() >= min_child_vox:
                     recurse(c, d)
@@ -431,18 +329,7 @@ def find_neck_events(dist, min_child_vox=30, max_events=64):
     return events
 
 
-# ---------------------------------------------------------------------------
-# Blender bridge
-# ---------------------------------------------------------------------------
-
 def detect_necks_blender(mesh_obj, resolution=96, sensitivity=0.3):
-    """Detect limb/neck cut candidates on a Blender mesh object.
-
-    resolution  : voxel grid size along the longest axis (64-192 useful).
-    sensitivity : minimum neck score (1 - neck/limb thickness ratio).
-                  Lower finds subtler pinches (wrists), higher keeps only
-                  strong necks.
-    """
     t0 = time.time()
     resolution = int(max(48, min(192, resolution)))
 
@@ -453,7 +340,6 @@ def detect_necks_blender(mesh_obj, resolution=96, sensitivity=0.3):
     print(f"[VibeCut] detect: {n_v} verts, {len(tris)} tris, "
           f"grid {resolution}, sensitivity {sensitivity:.2f}")
 
-    # Dense meshes seal the binned shell; low-poly ones leak -> BVH path.
     vox = None
     if len(tris) >= 5000:
         vox = _voxelize_shell_flood(verts, tris, resolution)
@@ -481,9 +367,6 @@ def detect_necks_blender(mesh_obj, resolution=96, sensitivity=0.3):
     print(f"[VibeCut] detect: {len(events)} raw split events in "
           f"{t3 - t2:.1f}s")
 
-    # Mesh vertex -> voxel lookup, built once and shared by every event.
-    # Only valid as datablock indices when the object carries no modifiers
-    # (_world_mesh_arrays reads the EVALUATED mesh).
     has_mods = bool(getattr(mesh_obj, "modifiers", None))
     vox_of_vert = None
     if not has_mods:
@@ -492,19 +375,12 @@ def detect_necks_blender(mesh_obj, resolution=96, sensitivity=0.3):
         vox_of_vert = np.ravel_multi_index(
             (vi[:, 0], vi[:, 1], vi[:, 2]), solid.shape)
 
-    # Voxel -> world, filter by sensitivity, dedupe.
     out = []
     for ev in events:
         if ev["score"] < sensitivity:
             continue
         wp = origin + (ev["pos"] + 0.5) * voxel_size
 
-        # Recover the limb's vertex membership from the voxel mask the split
-        # search already computed. Regrow the eroded core back out to the
-        # surface: `child` was taken at erosion depth d, so d dilations
-        # restricted to `solid` restores roughly the original limb. The neck is
-        # a bottleneck of radius ~d, so bleed past it is bounded by the neck
-        # itself — which is exactly where we want the seam.
         limb_idx = set()
         if vox_of_vert is not None:
             m = np.zeros(solid.size, dtype=bool)
@@ -517,9 +393,6 @@ def detect_necks_blender(mesh_obj, resolution=96, sensitivity=0.3):
 
         out.append({
             "world_pos": Vector(wp.tolist()),
-            # Point the normal from the limb toward the BODY. joints'
-            # place_press_fit embeds the pin behind the plane and pushes it
-            # along +no into the body, so this sign is load-bearing.
             "world_normal": Vector((-ev["direction"]).tolist()).normalized(),
             "radius_world": float(ev["radius_vox"] * voxel_size),
             "score": ev["score"],
@@ -543,10 +416,6 @@ def detect_necks_blender(mesh_obj, resolution=96, sensitivity=0.3):
     return deduped
 
 
-# ---------------------------------------------------------------------------
-# Scene property registration
-# ---------------------------------------------------------------------------
-
 _PROP_NAMES = (
     'vibecut_geo_show_settings', 'vibecut_geo_extremities',
     'vibecut_geo_levels', 'vibecut_geo_sensitivity',
@@ -563,7 +432,6 @@ _PROP_NAMES = (
 
 
 def register_props():
-    # Geodesic settings (experimental geodesic.py - not wired to UI)
     bpy.types.Scene.vibecut_geo_show_settings = bpy.props.BoolProperty(
         name="Show Geodesic Settings",
         default=False,
@@ -583,7 +451,6 @@ def register_props():
         description="Perimeter increase ratio to detect a joint (2.0 = perimeter doubles)",
         default=2.0, min=1.2, max=5.0, step=10,
     )
-    # CoACD settings (kept for compatibility with saved scenes)
     bpy.types.Scene.vibecut_coacd_show_settings = bpy.props.BoolProperty(
         name="Show Settings", default=False,
     )
